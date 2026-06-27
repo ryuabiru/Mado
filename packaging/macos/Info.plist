@@ -10,6 +10,8 @@
     <string>mado</string>
     <key>CFBundleIdentifier</key>
     <string>dev.abiru.mado</string>
+    <key>CFBundleIconFile</key>
+    <string>Mado.icns</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
@@ -89,4 +91,3 @@
     </array>
 </dict>
 </plist>
-

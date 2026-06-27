@@ -8,8 +8,9 @@ use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::keyboard::ModifiersState;
-use winit::window::{Window, WindowId};
+use winit::window::{Icon, Window, WindowId};
 
+use crate::config::Config;
 use crate::nvim::process::{NvimEvent, NvimProcess};
 use crate::nvim::redraw::{RedrawEvent, decode_redraw_notification};
 use crate::platform;
@@ -32,12 +33,11 @@ pub struct MadoApp {
     pressed_mouse_button: Option<&'static str>,
     close_requested: bool,
     ime_allowed: bool,
-    guifont: String,
-    linespace: i64,
+    config: Config,
 }
 
 impl MadoApp {
-    pub fn new(nvim: NvimProcess) -> Self {
+    pub fn new(nvim: NvimProcess, config: Config) -> Self {
         Self {
             nvim,
             grid: GridState::default(),
@@ -49,8 +49,7 @@ impl MadoApp {
             pressed_mouse_button: None,
             close_requested: false,
             ime_allowed: false,
-            guifont: String::new(),
-            linespace: 0,
+            config,
         }
     }
 
@@ -63,9 +62,6 @@ impl MadoApp {
                             for event in &events {
                                 if let RedrawEvent::ModeChange { mode, .. } = event {
                                     self.set_ime_for_mode(mode);
-                                }
-                                if let RedrawEvent::OptionSet { name, value } = event {
-                                    self.apply_ui_option(name, value);
                                 }
                             }
                             let flush = events.iter().any(|event| self.grid.apply(event));
@@ -179,38 +175,6 @@ impl MadoApp {
         debug!(mode, allowed, "updated IME availability for Neovim mode");
     }
 
-    fn apply_ui_option(&mut self, name: &str, value: &Value) {
-        let changed = match name {
-            "guifont" => value.as_str().is_some_and(|font| {
-                if self.guifont == font {
-                    return false;
-                }
-                self.guifont = font.to_owned();
-                if let Some(renderer) = &mut self.renderer {
-                    renderer.set_guifont(font);
-                }
-                true
-            }),
-            "linespace" => value.as_i64().is_some_and(|linespace| {
-                if self.linespace == linespace {
-                    return false;
-                }
-                self.linespace = linespace;
-                if let Some(renderer) = &mut self.renderer {
-                    renderer.set_linespace(linespace);
-                }
-                true
-            }),
-            _ => false,
-        };
-        if changed {
-            self.resize_neovim();
-            if let Some(window) = &self.window {
-                window.request_redraw();
-            }
-        }
-    }
-
     fn request_close(&mut self, event_loop: &ActiveEventLoop) {
         if self.close_requested {
             event_loop.exit();
@@ -258,7 +222,11 @@ impl ApplicationHandler for MadoApp {
         }
         let attributes = Window::default_attributes()
             .with_title("Mado")
-            .with_inner_size(LogicalSize::new(960.0, 640.0));
+            .with_window_icon(mado_window_icon())
+            .with_inner_size(LogicalSize::new(
+                self.config.window.width as f64,
+                self.config.window.height as f64,
+            ));
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::new(window),
             Err(error) => {
@@ -268,7 +236,11 @@ impl ApplicationHandler for MadoApp {
             }
         };
         window.set_ime_allowed(self.ime_allowed);
-        let mut renderer = match pollster::block_on(Renderer::new(window.clone(), event_loop)) {
+        let renderer = match pollster::block_on(Renderer::new(
+            window.clone(),
+            event_loop,
+            &self.config.font,
+        )) {
             Ok(renderer) => renderer,
             Err(error) => {
                 error!(%error, "failed to initialize renderer");
@@ -276,8 +248,6 @@ impl ApplicationHandler for MadoApp {
                 return;
             }
         };
-        renderer.set_guifont(&self.guifont);
-        renderer.set_linespace(self.linespace);
         self.renderer = Some(renderer);
         self.window = Some(window.clone());
         self.resize_neovim();
@@ -393,6 +363,21 @@ impl ApplicationHandler for MadoApp {
         event_loop.set_control_flow(ControlFlow::wait_duration(
             std::time::Duration::from_millis(8),
         ));
+    }
+}
+
+fn mado_window_icon() -> Option<Icon> {
+    #[cfg(target_os = "windows")]
+    {
+        const ICON_RGBA: &[u8] = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/packaging/icons/mado-256.rgba"
+        ));
+        Icon::from_rgba(ICON_RGBA.to_vec(), 256, 256).ok()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        None
     }
 }
 

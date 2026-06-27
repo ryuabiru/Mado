@@ -4,6 +4,8 @@
            UpgradeCode="A415A102-A716-4F4C-B84C-9284E8E3894D" Scope="perUser">
     <MajorUpgrade DowngradeErrorMessage="A newer version of Mado is already installed." />
     <MediaTemplate EmbedCab="yes" />
+    <Icon Id="MadoIcon" SourceFile="Mado.ico" />
+    <Property Id="ARPPRODUCTICON" Value="MadoIcon" />
 
     <StandardDirectory Id="LocalAppDataFolder">
       <Directory Id="MadoProgramsFolder" Name="Programs">
@@ -13,8 +15,9 @@
 
     <Component Id="MadoApplication" Directory="INSTALLFOLDER" Guid="*">
       <File Id="MadoExe" Source="..\..\target\x86_64-pc-windows-msvc\release\mado.exe" KeyPath="yes" />
+      <File Id="MadoIconFile" Source="Mado.ico" />
       <RegistryValue Root="HKCU" Key="Software\Classes\Mado.SourceFile" Type="string" Value="Mado source file" />
-      <RegistryValue Root="HKCU" Key="Software\Classes\Mado.SourceFile\DefaultIcon" Type="string" Value="&quot;[#MadoExe]&quot;,0" />
+      <RegistryValue Root="HKCU" Key="Software\Classes\Mado.SourceFile\DefaultIcon" Type="string" Value="&quot;[#MadoIconFile]&quot;" />
       <RegistryValue Root="HKCU" Key="Software\Classes\Mado.SourceFile\shell\open\command" Type="string" Value="&quot;[#MadoExe]&quot; &quot;%1&quot;" />
       <RegistryValue Root="HKCU" Key="Software\Classes\.md\OpenWithProgids" Name="Mado.SourceFile" Type="string" Value="" />
       <RegistryValue Root="HKCU" Key="Software\Classes\.markdown\OpenWithProgids" Name="Mado.SourceFile" Type="string" Value="" />
@@ -34,4 +37,3 @@
     </Feature>
   </Package>
 </Wix>
-

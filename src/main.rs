@@ -5,6 +5,7 @@ mod cli;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use cli::Cli;
+use mado::config::Config;
 use mado::nvim::process::{NvimLaunchOptions, NvimProcess, discover_nvim};
 use mado::ui::app::MadoApp;
 use tracing::info;
@@ -14,6 +15,7 @@ use winit::event_loop::EventLoop;
 fn main() -> Result<()> {
     init_logging();
     let cli = Cli::parse();
+    let config = Config::load(cli.config.as_deref());
     let executable = discover_nvim().context("Neovim executable was not found")?;
 
     info!(path = %executable.display(), "starting Neovim");
@@ -33,7 +35,7 @@ fn main() -> Result<()> {
     mado::platform::install_file_open_handler();
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
     event_loop
-        .run_app(&mut MadoApp::new(nvim))
+        .run_app(&mut MadoApp::new(nvim, config))
         .context("Mado event loop failed")
 }
 

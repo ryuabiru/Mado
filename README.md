@@ -12,21 +12,36 @@ and committed IME input to Neovim.
 Mado searches for Neovim through `MADO_NVIM`, `PATH`, and common macOS and
 Windows install locations.
 
-## Neovim-owned appearance
+## Settings ownership
 
-Mado uses Neovim as the source of truth for editor appearance. Configure the
-colorscheme, font, line spacing, and cursor in `init.lua`:
+Neovim remains the source of truth for editor colors, highlights, and cursor
+shape. Mado owns native-window concerns such as the font and initial window
+size. For example, keep this in `init.lua`:
 
 ```lua
 vim.cmd.colorscheme("catppuccin-mocha")
-vim.o.guifont = "SF Mono:h15,Menlo:h15,monospace:h15"
-vim.o.linespace = 0
 vim.o.guicursor = "n-v-c:block,i-ci-ve:ver25,r-cr-o:hor20"
 ```
 
-Mado consumes Neovim's `default_colors_set`, `hl_attr_define`, `option_set`,
-`mode_info_set`, and `mode_change` UI events. It does not maintain a separate
-editor colorscheme.
+Mado reads `config.toml` from:
+
+- macOS: `~/Library/Application Support/Mado/config.toml`
+- Windows: `%APPDATA%\Mado\config.toml`
+
+All fields are optional. The built-in defaults are equivalent to:
+
+```toml
+[font]
+family = "HackGen Console NF"
+size = 15.0
+
+[window]
+width = 960
+height = 640
+```
+
+Use `mado --config PATH` to load another file. Missing or invalid settings fall
+back to safe defaults. Mado does not maintain a separate editor colorscheme.
 
 ## Run
 

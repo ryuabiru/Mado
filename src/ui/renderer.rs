@@ -19,11 +19,11 @@ use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event_loop::ActiveEventLoop;
 use winit::window::Window;
 
+use crate::config::FontConfig;
 use crate::nvim::redraw::{CursorShape, CursorStyle};
 
 use super::grid::{GridState, ResolvedHighlight};
 
-const BASE_FONT_SIZE: f32 = 15.0;
 const BASE_PADDING: f32 = 6.0;
 const CELL_WIDTH_RATIO: f32 = 0.6;
 const CELL_HEIGHT_RATIO: f32 = 22.0 / 15.0;
@@ -60,14 +60,18 @@ pub struct Renderer {
     rect_vertex_capacity: u64,
     font_family: Option<String>,
     base_font_size: f32,
-    line_space: f32,
     japanese_font: Option<String>,
+    icon_font: Option<String>,
     scale_factor: f64,
     window: Arc<Window>,
 }
 
 impl Renderer {
-    pub async fn new(window: Arc<Window>, event_loop: &ActiveEventLoop) -> Result<Self> {
+    pub async fn new(
+        window: Arc<Window>,
+        event_loop: &ActiveEventLoop,
+        font: &FontConfig,
+    ) -> Result<Self> {
         let size = nonzero_size(window.inner_size());
         let instance = Instance::new(InstanceDescriptor::new_with_display_handle(Box::new(
             event_loop.owned_display_handle(),
@@ -105,11 +109,26 @@ impl Renderer {
 
         let rect_pipeline = create_rect_pipeline(&device, format);
         let mut font_system = FontSystem::new();
+        let font_family = find_font_family(&mut font_system, &font.family);
+        if let Some(family) = &font_family {
+            tracing::info!(family, size = font.size, "selected Mado font");
+        } else {
+            tracing::warn!(
+                family = font.family,
+                "configured font was not found; using platform monospace"
+            );
+        }
         let japanese_font = find_japanese_font(&mut font_system);
         if let Some(font) = &japanese_font {
             tracing::info!(font, "selected Japanese font");
         } else {
             tracing::warn!("no preferred Japanese font was found; using platform fallback");
+        }
+        let icon_font = find_icon_font(&mut font_system);
+        if let Some(font) = &icon_font {
+            tracing::info!(font, "selected icon font");
+        } else {
+            tracing::warn!("no Nerd Font was found; private-use icons may be unavailable");
         }
         let swash_cache = SwashCache::new();
         let cache = Cache::new(&device);
@@ -134,10 +153,10 @@ impl Renderer {
             rect_vertices: Vec::new(),
             rect_vertex_buffer: None,
             rect_vertex_capacity: 0,
-            font_family: None,
-            base_font_size: BASE_FONT_SIZE,
-            line_space: 0.0,
+            font_family,
+            base_font_size: font.size,
             japanese_font,
+            icon_font,
             scale_factor: window.scale_factor(),
             window,
         })
@@ -151,21 +170,6 @@ impl Renderer {
         self.config.width = size.width;
         self.config.height = size.height;
         self.surface.configure(&self.device, &self.config);
-    }
-
-    pub fn set_guifont(&mut self, specification: &str) {
-        let (family, size) = choose_guifont(&mut self.font_system, specification);
-        if let Some(size) = size.filter(|size| *size > 0.0) {
-            self.base_font_size = size;
-        }
-        if family != self.font_family {
-            tracing::info!(family = ?family, "updated font from Neovim guifont");
-            self.font_family = family;
-        }
-    }
-
-    pub fn set_linespace(&mut self, line_space: i64) {
-        self.line_space = line_space as f32;
     }
 
     pub fn grid_dimensions(&self) -> (u64, u64) {
@@ -354,9 +358,26 @@ impl Renderer {
                     continue;
                 }
                 let highlight = grid.resolve_highlight(cell.highlight_id);
+                let uses_unified_font = self
+                    .font_family
+                    .as_deref()
+                    .is_some_and(is_unified_font_family);
+                let icon_family = self.icon_font.as_deref().map(Family::Name);
                 let japanese_family = self.japanese_font.as_deref().map(Family::Name);
-                let uses_japanese_font = contains_japanese(&cell.text) && japanese_family.is_some();
-                let family = if uses_japanese_font {
+                let uses_icon_font =
+                    !uses_unified_font && contains_private_use(&cell.text) && icon_family.is_some();
+                let uses_japanese_font = !uses_unified_font
+                    && !uses_icon_font
+                    && contains_japanese(&cell.text)
+                    && japanese_family.is_some();
+                let family = if uses_unified_font {
+                    self.font_family
+                        .as_deref()
+                        .map(Family::Name)
+                        .unwrap_or(Family::Monospace)
+                } else if uses_icon_font {
+                    icon_family.unwrap_or(Family::Monospace)
+                } else if uses_japanese_font {
                     japanese_family.unwrap_or(Family::Monospace)
                 } else {
                     self.font_family
@@ -376,7 +397,7 @@ impl Renderer {
                     &mut self.font_system,
                     &cell.text,
                     &attrs,
-                    if uses_japanese_font {
+                    if uses_unified_font || uses_icon_font || uses_japanese_font {
                         Shaping::Basic
                     } else {
                         Shaping::Advanced
@@ -411,13 +432,16 @@ impl Renderer {
                 Some((UnicodeWidthStr::width(text).max(1) as f32 + 1.0) * cell_width),
                 Some(cell_height),
             );
-            let family = self
-                .japanese_font
+            let unified_font = self
+                .font_family
                 .as_deref()
+                .filter(|family| is_unified_font_family(family));
+            let family = unified_font
+                .or(self.japanese_font.as_deref())
                 .map(Family::Name)
                 .unwrap_or(Family::Monospace);
             let attrs = Attrs::new().family(family).color(glyphon_color(0xffffff));
-            let shaping = if self.japanese_font.is_some() {
+            let shaping = if unified_font.is_some() || self.japanese_font.is_some() {
                 Shaping::Basic
             } else {
                 Shaping::Advanced
@@ -631,8 +655,7 @@ impl Renderer {
     }
 
     fn cell_height(&self) -> f32 {
-        (self.base_font_size * CELL_HEIGHT_RATIO + self.line_space).max(self.base_font_size)
-            * self.scale()
+        (self.base_font_size * CELL_HEIGHT_RATIO).max(self.base_font_size) * self.scale()
     }
 
     fn padding(&self) -> f32 {
@@ -763,40 +786,14 @@ fn glyph_positions_are_safe(glyph: &PreparedGlyph) -> bool {
     })
 }
 
-fn choose_guifont(
-    font_system: &mut FontSystem,
-    specification: &str,
-) -> (Option<String>, Option<f32>) {
-    let mut requested_size = None;
-    for entry in specification.split(',').map(str::trim) {
-        if entry.is_empty() {
-            continue;
-        }
-        let mut parts = entry.split(':');
-        let family = parts
-            .next()
-            .unwrap_or_default()
-            .replace("\\ ", " ")
-            .replace('_', " ");
-        for option in parts {
-            if let Some(size) = option.strip_prefix('h').and_then(|size| size.parse().ok()) {
-                requested_size = Some(size);
-            }
-        }
-        if family.eq_ignore_ascii_case("monospace") {
-            return (None, requested_size);
-        }
-        if let Some(name) = font_system.db_mut().faces().find_map(|face| {
-            face.families
-                .iter()
-                .map(|(name, _)| name)
-                .find(|name| name.eq_ignore_ascii_case(&family))
-                .cloned()
-        }) {
-            return (Some(name), requested_size);
-        }
-    }
-    (None, requested_size)
+fn find_font_family(font_system: &mut FontSystem, requested: &str) -> Option<String> {
+    font_system.db_mut().faces().find_map(|face| {
+        face.families
+            .iter()
+            .map(|(name, _)| name)
+            .find(|name| name.eq_ignore_ascii_case(requested.trim()))
+            .cloned()
+    })
 }
 
 fn find_japanese_font(font_system: &mut FontSystem) -> Option<String> {
@@ -830,6 +827,50 @@ fn find_japanese_font(font_system: &mut FontSystem) -> Option<String> {
     None
 }
 
+fn find_icon_font(font_system: &mut FontSystem) -> Option<String> {
+    const CANDIDATES: &[&str] = &[
+        "HackGen Console NF",
+        "HackGen35 Console NF",
+        "Symbols Nerd Font Mono",
+        "Symbols Nerd Font",
+        "CaskaydiaCove Nerd Font Mono",
+        "JetBrainsMono Nerd Font Mono",
+        "Hack Nerd Font Mono",
+        "FiraCode Nerd Font Mono",
+        "MesloLGM Nerd Font Mono",
+    ];
+
+    let database = font_system.db_mut();
+    for candidate in CANDIDATES {
+        if let Some(name) = database.faces().find_map(|face| {
+            face.families
+                .iter()
+                .map(|(name, _)| name)
+                .find(|name| name.eq_ignore_ascii_case(candidate))
+                .cloned()
+        }) {
+            return Some(name);
+        }
+    }
+    database.faces().find_map(|face| {
+        face.families
+            .iter()
+            .map(|(name, _)| name)
+            .find(|name| is_icon_font_family(name))
+            .cloned()
+    })
+}
+
+fn is_icon_font_family(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.contains("nerd font") || (name.starts_with("hackgen") && name.ends_with(" nf"))
+}
+
+fn is_unified_font_family(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.starts_with("hackgen") && name.contains(" nf")
+}
+
 fn contains_japanese(text: &str) -> bool {
     text.chars().any(|character| {
         matches!(
@@ -844,10 +885,20 @@ fn contains_japanese(text: &str) -> bool {
     })
 }
 
+fn contains_private_use(text: &str) -> bool {
+    text.chars().any(|character| {
+        matches!(
+            character as u32,
+            0xe000..=0xf8ff | 0xf0000..=0xffffd | 0x100000..=0x10fffd
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        byte_column, choose_guifont, contains_japanese, find_japanese_font, srgb_to_linear,
+        byte_column, contains_japanese, contains_private_use, find_font_family, find_icon_font,
+        find_japanese_font, is_icon_font_family, is_unified_font_family, srgb_to_linear,
     };
     use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping};
 
@@ -866,6 +917,46 @@ mod tests {
     }
 
     #[test]
+    fn recognizes_nerd_font_private_use_characters() {
+        assert!(contains_private_use("\u{f07c}"));
+        assert!(contains_private_use("\u{e0b0}"));
+        assert!(!contains_private_use("日本語 abc ◀"));
+    }
+
+    #[test]
+    fn recognizes_common_icon_font_family_names() {
+        assert!(is_icon_font_family("HackGen Console NF"));
+        assert!(is_icon_font_family("JetBrainsMono Nerd Font Mono"));
+        assert!(!is_icon_font_family("SF Mono"));
+        assert!(is_unified_font_family("HackGen Console NF"));
+        assert!(!is_unified_font_family("JetBrainsMono Nerd Font Mono"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn finds_installed_nerd_font_when_available() {
+        let mut font_system = FontSystem::new();
+        let font = find_icon_font(&mut font_system);
+        eprintln!("Icon font: {font:?}");
+        let font = font.expect("an installed Nerd Font should be detected");
+        let mut buffer = Buffer::new(&mut font_system, Metrics::new(15.0, 22.0));
+        buffer.set_text(
+            &mut font_system,
+            "\u{f07c}\u{e0b0}",
+            &Attrs::new().family(Family::Name(&font)),
+            Shaping::Basic,
+            None,
+        );
+        buffer.shape_until_scroll(&mut font_system, false);
+        assert!(
+            buffer
+                .layout_runs()
+                .flat_map(|run| run.glyphs.iter())
+                .all(|glyph| glyph.glyph_id != 0)
+        );
+    }
+
+    #[test]
     fn converts_srgb_colors_for_the_gpu_surface() {
         assert!((srgb_to_linear(0.5) - 0.214_041_14).abs() < 0.0001);
         assert_eq!(srgb_to_linear(0.0), 0.0);
@@ -873,10 +964,11 @@ mod tests {
     }
 
     #[test]
-    fn parses_neovim_guifont_size_and_fallbacks() {
+    fn finds_configured_font_case_insensitively() {
         let mut font_system = FontSystem::new();
-        let (_, size) = choose_guifont(&mut font_system, "Missing Font:h17,monospace");
-        assert_eq!(size, Some(17.0));
+        let font = find_font_family(&mut font_system, "hackgen console nf");
+        #[cfg(target_os = "macos")]
+        assert_eq!(font.as_deref(), Some("HackGen Console NF"));
     }
 
     #[cfg(any(target_os = "macos", target_os = "windows"))]
