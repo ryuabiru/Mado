@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="Mado" Manufacturer="abiru" Version="0.1.0"
+           UpgradeCode="A415A102-A716-4F4C-B84C-9284E8E3894D" Scope="perUser">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Mado is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="MadoProgramsFolder" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="Mado" />
+      </Directory>
+    </StandardDirectory>
+
+    <Component Id="MadoApplication" Directory="INSTALLFOLDER" Guid="*">
+      <File Id="MadoExe" Source="..\..\target\x86_64-pc-windows-msvc\release\mado.exe" KeyPath="yes" />
+      <RegistryValue Root="HKCU" Key="Software\Classes\Mado.SourceFile" Type="string" Value="Mado source file" />
+      <RegistryValue Root="HKCU" Key="Software\Classes\Mado.SourceFile\DefaultIcon" Type="string" Value="&quot;[#MadoExe]&quot;,0" />
+      <RegistryValue Root="HKCU" Key="Software\Classes\Mado.SourceFile\shell\open\command" Type="string" Value="&quot;[#MadoExe]&quot; &quot;%1&quot;" />
+      <RegistryValue Root="HKCU" Key="Software\Classes\.md\OpenWithProgids" Name="Mado.SourceFile" Type="string" Value="" />
+      <RegistryValue Root="HKCU" Key="Software\Classes\.markdown\OpenWithProgids" Name="Mado.SourceFile" Type="string" Value="" />
+      <RegistryValue Root="HKCU" Key="Software\Classes\.txt\OpenWithProgids" Name="Mado.SourceFile" Type="string" Value="" />
+      <RegistryValue Root="HKCU" Key="Software\Classes\.py\OpenWithProgids" Name="Mado.SourceFile" Type="string" Value="" />
+      <RegistryValue Root="HKCU" Key="Software\Classes\.rs\OpenWithProgids" Name="Mado.SourceFile" Type="string" Value="" />
+      <RegistryValue Root="HKCU" Key="Software\Classes\.js\OpenWithProgids" Name="Mado.SourceFile" Type="string" Value="" />
+      <RegistryValue Root="HKCU" Key="Software\Classes\.ts\OpenWithProgids" Name="Mado.SourceFile" Type="string" Value="" />
+      <RegistryValue Root="HKCU" Key="Software\Classes\.json\OpenWithProgids" Name="Mado.SourceFile" Type="string" Value="" />
+      <RegistryValue Root="HKCU" Key="Software\Classes\.toml\OpenWithProgids" Name="Mado.SourceFile" Type="string" Value="" />
+      <RegistryValue Root="HKCU" Key="Software\Classes\.yaml\OpenWithProgids" Name="Mado.SourceFile" Type="string" Value="" />
+      <RegistryValue Root="HKCU" Key="Software\Classes\.lua\OpenWithProgids" Name="Mado.SourceFile" Type="string" Value="" />
+    </Component>
+
+    <Feature Id="MainFeature" Title="Mado" Level="1">
+      <ComponentRef Id="MadoApplication" />
+    </Feature>
+  </Package>
+</Wix>
+

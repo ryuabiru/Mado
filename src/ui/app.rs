@@ -1,0 +1,426 @@
+use std::sync::Arc;
+use std::sync::mpsc::TryRecvError;
+
+use rmpv::Value;
+use tracing::{debug, error, info, warn};
+use winit::application::ApplicationHandler;
+use winit::dpi::{LogicalSize, PhysicalPosition};
+use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow};
+use winit::keyboard::ModifiersState;
+use winit::window::{Window, WindowId};
+
+use crate::nvim::process::{NvimEvent, NvimProcess};
+use crate::nvim::redraw::{RedrawEvent, decode_redraw_notification};
+use crate::platform;
+
+use super::grid::GridState;
+use super::ime::ImeState;
+use super::input::{key_to_nvim, nvim_modifiers};
+use super::renderer::Renderer;
+
+const MAX_RPC_EVENTS_PER_TICK: usize = 256;
+
+pub struct MadoApp {
+    nvim: NvimProcess,
+    grid: GridState,
+    ime: ImeState,
+    renderer: Option<Renderer>,
+    window: Option<Arc<Window>>,
+    modifiers: ModifiersState,
+    mouse_position: PhysicalPosition<f64>,
+    pressed_mouse_button: Option<&'static str>,
+    close_requested: bool,
+    ime_allowed: bool,
+    guifont: String,
+    linespace: i64,
+}
+
+impl MadoApp {
+    pub fn new(nvim: NvimProcess) -> Self {
+        Self {
+            nvim,
+            grid: GridState::default(),
+            ime: ImeState::default(),
+            renderer: None,
+            window: None,
+            modifiers: ModifiersState::empty(),
+            mouse_position: PhysicalPosition::new(0.0, 0.0),
+            pressed_mouse_button: None,
+            close_requested: false,
+            ime_allowed: false,
+            guifont: String::new(),
+            linespace: 0,
+        }
+    }
+
+    fn process_rpc_events(&mut self, event_loop: &ActiveEventLoop) {
+        for _ in 0..MAX_RPC_EVENTS_PER_TICK {
+            match self.nvim.events().try_recv() {
+                Ok(NvimEvent::Notification { method, params }) if method == "redraw" => {
+                    match decode_redraw_notification(&params) {
+                        Ok(events) => {
+                            for event in &events {
+                                if let RedrawEvent::ModeChange { mode, .. } = event {
+                                    self.set_ime_for_mode(mode);
+                                }
+                                if let RedrawEvent::OptionSet { name, value } = event {
+                                    self.apply_ui_option(name, value);
+                                }
+                            }
+                            let flush = events.iter().any(|event| self.grid.apply(event));
+                            if flush {
+                                self.update_ime_cursor_area();
+                                if let Some(window) = &self.window {
+                                    window.request_redraw();
+                                }
+                            }
+                        }
+                        Err(error) => warn!(%error, "invalid redraw notification"),
+                    }
+                }
+                Ok(NvimEvent::Notification { method, .. }) => {
+                    debug!(%method, "ignoring non-UI notification");
+                }
+                Ok(NvimEvent::ProtocolError(message)) => {
+                    error!(%message, "Neovim RPC protocol error");
+                }
+                Ok(NvimEvent::Eof) => {
+                    info!("Neovim exited");
+                    event_loop.exit();
+                    return;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    error!("Neovim RPC reader disconnected");
+                    event_loop.exit();
+                    return;
+                }
+            }
+        }
+
+        match self.nvim.try_wait() {
+            Ok(Some(status)) => {
+                info!(%status, "Neovim exited");
+                event_loop.exit();
+            }
+            Ok(None) => {}
+            Err(error) => {
+                error!(%error, "failed to query Neovim process");
+                event_loop.exit();
+            }
+        }
+    }
+
+    fn send_input(&self, input: String) {
+        if let Err(error) = self
+            .nvim
+            .rpc()
+            .notify("nvim_input", vec![Value::from(input)])
+        {
+            error!(%error, "failed to send input to Neovim");
+        }
+    }
+
+    fn resize_neovim(&self) {
+        let Some(renderer) = &self.renderer else {
+            return;
+        };
+        let (width, height) = renderer.grid_dimensions();
+        if let Err(error) = self.nvim.rpc().notify(
+            "nvim_ui_try_resize",
+            vec![Value::from(width), Value::from(height)],
+        ) {
+            error!(%error, "failed to resize Neovim UI");
+        }
+    }
+
+    fn send_mouse(&self, button: &str, action: &str) {
+        let Some(renderer) = &self.renderer else {
+            return;
+        };
+        let (row, col) = renderer.cell_at(self.mouse_position);
+        let modifiers = nvim_modifiers(self.modifiers);
+        if let Err(error) = self.nvim.rpc().notify(
+            "nvim_input_mouse",
+            vec![
+                Value::from(button),
+                Value::from(action),
+                Value::from(modifiers),
+                Value::from(1),
+                Value::from(row),
+                Value::from(col),
+            ],
+        ) {
+            error!(%error, "failed to send mouse input to Neovim");
+        }
+    }
+
+    fn update_ime_cursor_area(&self) {
+        let (Some(renderer), Some(window)) = (&self.renderer, &self.window) else {
+            return;
+        };
+        let (position, size) = renderer.ime_cursor_area(&self.grid, self.ime.preedit());
+        window.set_ime_cursor_area(position, size);
+    }
+
+    fn set_ime_for_mode(&mut self, mode: &str) {
+        let allowed = mode_allows_ime(mode);
+        if self.ime_allowed == allowed {
+            return;
+        }
+        self.ime_allowed = allowed;
+        if !allowed {
+            self.ime.cancel();
+        }
+        if let Some(window) = &self.window {
+            window.set_ime_allowed(allowed);
+        }
+        debug!(mode, allowed, "updated IME availability for Neovim mode");
+    }
+
+    fn apply_ui_option(&mut self, name: &str, value: &Value) {
+        let changed = match name {
+            "guifont" => value.as_str().is_some_and(|font| {
+                if self.guifont == font {
+                    return false;
+                }
+                self.guifont = font.to_owned();
+                if let Some(renderer) = &mut self.renderer {
+                    renderer.set_guifont(font);
+                }
+                true
+            }),
+            "linespace" => value.as_i64().is_some_and(|linespace| {
+                if self.linespace == linespace {
+                    return false;
+                }
+                self.linespace = linespace;
+                if let Some(renderer) = &mut self.renderer {
+                    renderer.set_linespace(linespace);
+                }
+                true
+            }),
+            _ => false,
+        };
+        if changed {
+            self.resize_neovim();
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        }
+    }
+
+    fn request_close(&mut self, event_loop: &ActiveEventLoop) {
+        if self.close_requested {
+            event_loop.exit();
+            return;
+        }
+        self.close_requested = true;
+        self.send_input("<Esc>:confirm qa<CR>".to_owned());
+    }
+
+    fn open_file(&self, path: &std::path::Path) {
+        let command = Value::Map(vec![
+            (Value::from("cmd"), Value::from("edit")),
+            (
+                Value::from("args"),
+                Value::Array(vec![Value::from(path.to_string_lossy().into_owned())]),
+            ),
+            (
+                Value::from("magic"),
+                Value::Map(vec![
+                    (Value::from("file"), Value::from(false)),
+                    (Value::from("bar"), Value::from(false)),
+                ]),
+            ),
+            (
+                Value::from("mods"),
+                Value::Map(vec![(Value::from("confirm"), Value::from(true))]),
+            ),
+        ]);
+        if let Err(error) = self
+            .nvim
+            .rpc()
+            .notify("nvim_cmd", vec![command, Value::Map(Vec::new())])
+        {
+            error!(path = %path.display(), %error, "failed to open file from the OS");
+        } else {
+            info!(path = %path.display(), "opening file from the OS");
+        }
+    }
+}
+
+impl ApplicationHandler for MadoApp {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.window.is_some() {
+            return;
+        }
+        let attributes = Window::default_attributes()
+            .with_title("Mado")
+            .with_inner_size(LogicalSize::new(960.0, 640.0));
+        let window = match event_loop.create_window(attributes) {
+            Ok(window) => Arc::new(window),
+            Err(error) => {
+                error!(%error, "failed to create window");
+                event_loop.exit();
+                return;
+            }
+        };
+        window.set_ime_allowed(self.ime_allowed);
+        let mut renderer = match pollster::block_on(Renderer::new(window.clone(), event_loop)) {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                error!(%error, "failed to initialize renderer");
+                event_loop.exit();
+                return;
+            }
+        };
+        renderer.set_guifont(&self.guifont);
+        renderer.set_linespace(self.linespace);
+        self.renderer = Some(renderer);
+        self.window = Some(window.clone());
+        self.resize_neovim();
+        self.update_ime_cursor_area();
+        window.request_redraw();
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        _window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        match event {
+            WindowEvent::CloseRequested => self.request_close(event_loop),
+            WindowEvent::Resized(size) => {
+                if let Some(renderer) = &mut self.renderer {
+                    let scale = self
+                        .window
+                        .as_ref()
+                        .map_or(1.0, |window| window.scale_factor());
+                    renderer.resize(size, scale);
+                }
+                self.resize_neovim();
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                if let (Some(renderer), Some(window)) = (&mut self.renderer, &self.window) {
+                    renderer.resize(window.inner_size(), scale_factor);
+                }
+                self.resize_neovim();
+            }
+            WindowEvent::RedrawRequested => {
+                if let Some(renderer) = &mut self.renderer
+                    && let Err(error) = renderer.render(&self.grid, self.ime.preedit())
+                {
+                    error!(%error, "render failed");
+                }
+            }
+            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
+            WindowEvent::KeyboardInput { event, .. } => {
+                if !self.ime.blocks_keyboard_input()
+                    && let Some(input) = key_to_nvim(&event, self.modifiers)
+                {
+                    self.send_input(input);
+                }
+            }
+            WindowEvent::Ime(ime) => {
+                match ime {
+                    Ime::Enabled => {}
+                    Ime::Preedit(text, cursor) => self.ime.set_preedit(text, cursor),
+                    Ime::Commit(text) => {
+                        if let Some(text) = self.ime.commit(text) {
+                            self.send_input(text);
+                        }
+                    }
+                    Ime::Disabled => self.ime.cancel(),
+                }
+                self.update_ime_cursor_area();
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+            WindowEvent::Focused(false) => self.ime.cancel(),
+            WindowEvent::CursorMoved { position, .. } => {
+                self.mouse_position = position;
+                if let Some(button) = self.pressed_mouse_button {
+                    self.send_mouse(button, "drag");
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                let button = match button {
+                    MouseButton::Left => Some("left"),
+                    MouseButton::Right => Some("right"),
+                    MouseButton::Middle => Some("middle"),
+                    _ => None,
+                };
+                if let Some(button) = button {
+                    let action = if state == ElementState::Pressed {
+                        self.pressed_mouse_button = Some(button);
+                        "press"
+                    } else {
+                        self.pressed_mouse_button = None;
+                        "release"
+                    };
+                    self.send_mouse(button, action);
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let (button, action) = match delta {
+                    MouseScrollDelta::LineDelta(_, y) if y > 0.0 => ("wheel", "up"),
+                    MouseScrollDelta::LineDelta(_, y) if y < 0.0 => ("wheel", "down"),
+                    MouseScrollDelta::LineDelta(x, _) if x > 0.0 => ("wheel", "right"),
+                    MouseScrollDelta::LineDelta(x, _) if x < 0.0 => ("wheel", "left"),
+                    MouseScrollDelta::PixelDelta(position) if position.y > 0.0 => ("wheel", "up"),
+                    MouseScrollDelta::PixelDelta(position) if position.y < 0.0 => ("wheel", "down"),
+                    MouseScrollDelta::PixelDelta(position) if position.x > 0.0 => {
+                        ("wheel", "right")
+                    }
+                    MouseScrollDelta::PixelDelta(position) if position.x < 0.0 => ("wheel", "left"),
+                    _ => return,
+                };
+                self.send_mouse(button, action);
+            }
+            _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        for path in platform::take_open_files() {
+            self.open_file(&path);
+        }
+        self.process_rpc_events(event_loop);
+        event_loop.set_control_flow(ControlFlow::wait_duration(
+            std::time::Duration::from_millis(8),
+        ));
+    }
+}
+
+fn mode_allows_ime(mode: &str) -> bool {
+    mode.starts_with("insert")
+        || mode.starts_with("replace")
+        || mode.starts_with("cmdline")
+        || mode.starts_with("terminal")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mode_allows_ime;
+
+    #[test]
+    fn enables_ime_only_for_text_entry_modes() {
+        for mode in [
+            "insert",
+            "insert_completion",
+            "replace",
+            "cmdline_normal",
+            "cmdline_insert",
+            "terminal",
+        ] {
+            assert!(mode_allows_ime(mode), "{mode}");
+        }
+        for mode in ["normal", "visual", "operator", "select"] {
+            assert!(!mode_allows_ime(mode), "{mode}");
+        }
+    }
+}
