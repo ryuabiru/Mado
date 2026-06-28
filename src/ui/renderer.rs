@@ -42,6 +42,13 @@ struct PreparedGlyph {
     color: Color,
 }
 
+#[derive(Default)]
+struct CachedGlyphRow {
+    revision: Option<u64>,
+    cursor_col: Option<usize>,
+    glyphs: Vec<PreparedGlyph>,
+}
+
 pub struct Renderer {
     instance: Instance,
     device: wgpu::Device,
@@ -54,7 +61,8 @@ pub struct Renderer {
     viewport: Viewport,
     atlas: TextAtlas,
     text_renderer: TextRenderer,
-    glyphs: Vec<PreparedGlyph>,
+    glyph_rows: Vec<CachedGlyphRow>,
+    preedit_glyph: Option<PreparedGlyph>,
     rect_vertices: Vec<RectVertex>,
     rect_vertex_buffer: Option<wgpu::Buffer>,
     rect_vertex_capacity: u64,
@@ -149,7 +157,8 @@ impl Renderer {
             viewport,
             atlas,
             text_renderer,
-            glyphs: Vec::new(),
+            glyph_rows: Vec::new(),
+            preedit_glyph: None,
             rect_vertices: Vec::new(),
             rect_vertex_buffer: None,
             rect_vertex_capacity: 0,
@@ -163,6 +172,9 @@ impl Renderer {
     }
 
     pub fn resize(&mut self, size: PhysicalSize<u32>, scale_factor: f64) {
+        if self.scale_factor != scale_factor {
+            self.glyph_rows.clear();
+        }
         self.scale_factor = scale_factor;
         if size.width == 0 || size.height == 0 {
             return;
@@ -185,6 +197,13 @@ impl Renderer {
         let col = ((position.x as f32 - self.padding()).max(0.0) / self.cell_width()).floor();
         let row = ((position.y as f32 - self.padding()).max(0.0) / self.cell_height()).floor();
         (row as u64, col as u64)
+    }
+
+    pub fn pixel_scroll_lines(&self, horizontal: f64, vertical: f64) -> (f64, f64) {
+        (
+            horizontal / f64::from(self.cell_width()),
+            vertical / f64::from(self.cell_height()),
+        )
     }
 
     pub fn ime_cursor_area(
@@ -212,8 +231,9 @@ impl Renderer {
         &mut self,
         grid: &GridState,
         preedit: Option<(&str, Option<(usize, usize)>)>,
+        cursor_visible: bool,
     ) -> Result<()> {
-        self.prepare_glyphs(grid, preedit);
+        self.prepare_glyphs(grid, preedit, cursor_visible);
         self.viewport.update(
             &self.queue,
             Resolution {
@@ -223,8 +243,10 @@ impl Renderer {
         );
 
         let unsafe_glyphs = self
-            .glyphs
+            .glyph_rows
             .iter()
+            .flat_map(|row| &row.glyphs)
+            .chain(self.preedit_glyph.iter())
             .filter(|glyph| !glyph_positions_are_safe(glyph))
             .count();
         if unsafe_glyphs > 0 {
@@ -234,8 +256,10 @@ impl Renderer {
             );
         }
         let text_areas = self
-            .glyphs
+            .glyph_rows
             .iter()
+            .flat_map(|row| &row.glyphs)
+            .chain(self.preedit_glyph.iter())
             .filter(|glyph| glyph_positions_are_safe(glyph))
             .map(|glyph| TextArea {
                 buffer: &glyph.buffer,
@@ -294,7 +318,7 @@ impl Renderer {
             });
         let mut rect_vertices = std::mem::take(&mut self.rect_vertices);
         rect_vertices.clear();
-        self.append_rectangle_vertices(grid, preedit, &mut rect_vertices);
+        self.append_rectangle_vertices(grid, preedit, cursor_visible, &mut rect_vertices);
         self.rect_vertices = rect_vertices;
         self.ensure_rect_vertex_buffer();
         if let Some(buffer) = &self.rect_vertex_buffer
@@ -343,13 +367,27 @@ impl Renderer {
         &mut self,
         grid: &GridState,
         preedit: Option<(&str, Option<(usize, usize)>)>,
+        cursor_visible: bool,
     ) {
-        self.glyphs.clear();
         let metrics = Metrics::new(self.font_size(), self.cell_height());
         let cell_width = self.cell_width();
         let cell_height = self.cell_height();
         let padding = self.padding();
+        self.glyph_rows
+            .resize_with(grid.height(), CachedGlyphRow::default);
+        self.glyph_rows.truncate(grid.height());
         for row in 0..grid.height() {
+            let cursor_col = (cursor_visible
+                && grid.cursor_style().shape == CursorShape::Block
+                && grid.cursor_is_on_main_grid()
+                && grid.cursor().row == row)
+                .then_some(grid.cursor().col);
+            if self.glyph_rows[row].revision == Some(grid.row_revision(row))
+                && self.glyph_rows[row].cursor_col == cursor_col
+            {
+                continue;
+            }
+            let mut glyphs = Vec::new();
             for col in 0..grid.width() {
                 let Some(cell) = grid.cell(row, col) else {
                     continue;
@@ -405,25 +443,25 @@ impl Renderer {
                     None,
                 );
                 buffer.shape_until_scroll(&mut self.font_system, false);
-                self.glyphs.push(PreparedGlyph {
+                glyphs.push(PreparedGlyph {
                     buffer,
                     left: padding + col as f32 * cell_width,
                     top: padding + row as f32 * cell_height,
-                    color: glyphon_color(
-                        if grid.cursor_style().shape == CursorShape::Block
-                            && grid.cursor_is_on_main_grid()
-                            && grid.cursor().row == row
-                            && grid.cursor().col == col
-                        {
-                            highlight.background
-                        } else {
-                            highlight.foreground
-                        },
-                    ),
+                    color: glyphon_color(if cursor_col == Some(col) {
+                        highlight.background
+                    } else {
+                        highlight.foreground
+                    }),
                 });
             }
+            self.glyph_rows[row] = CachedGlyphRow {
+                revision: Some(grid.row_revision(row)),
+                cursor_col,
+                glyphs,
+            };
         }
 
+        self.preedit_glyph = None;
         if let Some((text, _)) = preedit.filter(|(text, _)| !text.is_empty()) {
             let mut buffer = Buffer::new(&mut self.font_system, metrics);
             buffer.set_wrap(&mut self.font_system, Wrap::None);
@@ -449,7 +487,7 @@ impl Renderer {
             buffer.set_text(&mut self.font_system, text, &attrs, shaping, None);
             buffer.shape_until_scroll(&mut self.font_system, false);
             let cursor = grid.cursor();
-            self.glyphs.push(PreparedGlyph {
+            self.preedit_glyph = Some(PreparedGlyph {
                 buffer,
                 left: padding + cursor.col as f32 * cell_width,
                 top: padding + cursor.row as f32 * cell_height,
@@ -462,6 +500,7 @@ impl Renderer {
         &self,
         grid: &GridState,
         preedit: Option<(&str, Option<(usize, usize)>)>,
+        cursor_visible: bool,
         vertices: &mut Vec<RectVertex>,
     ) {
         for (index, cell) in grid.cells().iter().enumerate() {
@@ -512,7 +551,7 @@ impl Renderer {
             }
         }
 
-        if grid.cursor_is_on_main_grid() && grid.cursor().row < grid.height() {
+        if cursor_visible && grid.cursor_is_on_main_grid() && grid.cursor().row < grid.height() {
             let cursor = grid.cursor();
             let style = grid.cursor_style();
             let highlight = grid
@@ -521,15 +560,16 @@ impl Renderer {
                 .unwrap_or_else(|| grid.resolve_highlight(0));
             let color = cursor_color(grid, &style, highlight);
             let percentage = style.cell_percentage.clamp(1, 100) as f32 / 100.0;
+            let cursor_width = self.cell_width() * cursor_cell_columns(grid) as f32;
             let (x_offset, y_offset, width, height) = match style.shape {
-                CursorShape::Block => (0.0, 0.0, self.cell_width(), self.cell_height()),
+                CursorShape::Block => (0.0, 0.0, cursor_width, self.cell_height()),
                 CursorShape::Vertical => {
                     (0.0, 0.0, self.cell_width() * percentage, self.cell_height())
                 }
                 CursorShape::Horizontal => (
                     0.0,
                     self.cell_height() * (1.0 - percentage),
-                    self.cell_width(),
+                    cursor_width,
                     self.cell_height() * percentage,
                 ),
             };
@@ -755,6 +795,13 @@ fn cursor_color(grid: &GridState, style: &CursorStyle, cell: ResolvedHighlight) 
         .unwrap_or(cell.foreground)
 }
 
+fn cursor_cell_columns(grid: &GridState) -> usize {
+    let cursor = grid.cursor();
+    grid.cell(cursor.row, cursor.col)
+        .map(|cell| UnicodeWidthStr::width(cell.text.as_str()).max(1))
+        .unwrap_or(1)
+}
+
 fn nonzero_size(size: PhysicalSize<u32>) -> PhysicalSize<u32> {
     PhysicalSize::new(size.width.max(1), size.height.max(1))
 }
@@ -897,9 +944,12 @@ fn contains_private_use(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        byte_column, contains_japanese, contains_private_use, find_font_family, find_icon_font,
-        find_japanese_font, is_icon_font_family, is_unified_font_family, srgb_to_linear,
+        byte_column, contains_japanese, contains_private_use, cursor_cell_columns,
+        find_font_family, find_icon_font, find_japanese_font, is_icon_font_family,
+        is_unified_font_family, srgb_to_linear,
     };
+    use crate::nvim::redraw::{GridCell, RedrawEvent};
+    use crate::ui::grid::GridState;
     use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping};
 
     #[test]
@@ -907,6 +957,34 @@ mod tests {
         assert_eq!(byte_column("a日本", 1), 1);
         assert_eq!(byte_column("a日本", 4), 3);
         assert_eq!(byte_column("a日本", 7), 5);
+    }
+
+    #[test]
+    fn expands_cursor_to_cover_a_wide_character() {
+        let mut grid = GridState::default();
+        grid.apply(&RedrawEvent::GridResize {
+            grid: 1,
+            width: 3,
+            height: 1,
+        });
+        grid.apply(&RedrawEvent::GridLine {
+            grid: 1,
+            row: 0,
+            col_start: 0,
+            cells: vec![GridCell {
+                text: "日".into(),
+                highlight_id: Some(0),
+                repeat: 1,
+            }],
+            wrap: false,
+        });
+        grid.apply(&RedrawEvent::GridCursorGoto {
+            grid: 1,
+            row: 0,
+            col: 0,
+        });
+
+        assert_eq!(cursor_cell_columns(&grid), 2);
     }
 
     #[test]

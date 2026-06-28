@@ -45,6 +45,8 @@ pub struct GridState {
     cursor_style_enabled: bool,
     cursor_styles: Vec<CursorStyle>,
     mode_index: usize,
+    row_revisions: Vec<u64>,
+    next_revision: u64,
 }
 
 impl Default for GridState {
@@ -62,6 +64,8 @@ impl Default for GridState {
             cursor_style_enabled: false,
             cursor_styles: Vec::new(),
             mode_index: 0,
+            row_revisions: Vec::new(),
+            next_revision: 1,
         }
     }
 }
@@ -111,8 +115,12 @@ impl GridState {
                         col += 1;
                     }
                 }
+                self.mark_row_dirty(row);
             }
-            RedrawEvent::GridClear { grid: 1 } => self.cells.fill(Cell::default()),
+            RedrawEvent::GridClear { grid: 1 } => {
+                self.cells.fill(Cell::default());
+                self.mark_all_rows_dirty();
+            }
             RedrawEvent::GridCursorGoto { grid, row, col } => {
                 self.cursor_grid = *grid;
                 self.cursor = Cursor {
@@ -150,9 +158,11 @@ impl GridState {
                 if *special >= 0 {
                     self.special = *special as u32;
                 }
+                self.mark_all_rows_dirty();
             }
             RedrawEvent::HighlightDefine { id, attrs } => {
                 self.highlights.insert(*id, attrs.clone());
+                self.mark_all_rows_dirty();
             }
             RedrawEvent::ModeInfoSet {
                 cursor_style_enabled,
@@ -208,6 +218,10 @@ impl GridState {
             .unwrap_or_default()
     }
 
+    pub fn row_revision(&self, row: usize) -> u64 {
+        self.row_revisions.get(row).copied().unwrap_or(0)
+    }
+
     pub fn resolve_highlight(&self, id: u64) -> ResolvedHighlight {
         let attrs = self.highlights.get(&id).cloned().unwrap_or_default();
         let mut foreground = attrs.foreground.unwrap_or(self.foreground);
@@ -254,6 +268,8 @@ impl GridState {
         self.width = width;
         self.height = height;
         self.cells = cells;
+        self.row_revisions.resize(height, 0);
+        self.mark_all_rows_dirty();
     }
 
     fn cell_mut(&mut self, row: usize, col: usize) -> Option<&mut Cell> {
@@ -292,6 +308,23 @@ impl GridState {
                     self.scroll_cell(row, col, top, bottom, left, right, rows, cols);
                 }
             }
+        }
+        for row in top..bottom {
+            self.mark_row_dirty(row);
+        }
+    }
+
+    fn mark_row_dirty(&mut self, row: usize) {
+        let Some(revision) = self.row_revisions.get_mut(row) else {
+            return;
+        };
+        *revision = self.next_revision;
+        self.next_revision = self.next_revision.wrapping_add(1).max(1);
+    }
+
+    fn mark_all_rows_dirty(&mut self) {
+        for row in 0..self.row_revisions.len() {
+            self.mark_row_dirty(row);
         }
     }
 
@@ -434,5 +467,28 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["x", "x"]
         );
+    }
+
+    #[test]
+    fn revisions_only_the_rows_changed_by_line_updates() {
+        let mut grid = GridState::default();
+        grid.resize(3, 2);
+        let first_row = grid.row_revision(0);
+        let second_row = grid.row_revision(1);
+
+        grid.apply(&RedrawEvent::GridLine {
+            grid: 1,
+            row: 1,
+            col_start: 0,
+            cells: vec![GridCell {
+                text: "changed".into(),
+                highlight_id: Some(1),
+                repeat: 1,
+            }],
+            wrap: false,
+        });
+
+        assert_eq!(grid.row_revision(0), first_row);
+        assert_ne!(grid.row_revision(1), second_row);
     }
 }

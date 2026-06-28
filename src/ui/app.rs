@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::sync::mpsc::TryRecvError;
+use std::time::{Duration, Instant};
 
 use rmpv::Value;
 use tracing::{debug, error, info, warn};
@@ -12,15 +13,86 @@ use winit::window::{Icon, Window, WindowId};
 
 use crate::config::Config;
 use crate::nvim::process::{NvimEvent, NvimProcess};
-use crate::nvim::redraw::{RedrawEvent, decode_redraw_notification};
+use crate::nvim::redraw::{CursorStyle, RedrawEvent, decode_redraw_notification};
 use crate::platform;
 
 use super::grid::GridState;
 use super::ime::ImeState;
-use super::input::{key_to_nvim, nvim_modifiers};
+use super::input::{WheelAccumulator, WheelDirection, key_to_nvim, nvim_modifiers};
 use super::renderer::Renderer;
 
 const MAX_RPC_EVENTS_PER_TICK: usize = 256;
+
+#[derive(Debug, Clone, Copy)]
+enum BlinkPhase {
+    Waiting,
+    Visible,
+    Hidden,
+}
+
+#[derive(Debug)]
+struct CursorBlink {
+    visible: bool,
+    phase: BlinkPhase,
+    deadline: Option<Instant>,
+    blink_on: Duration,
+    blink_off: Duration,
+}
+
+impl Default for CursorBlink {
+    fn default() -> Self {
+        Self {
+            visible: true,
+            phase: BlinkPhase::Waiting,
+            deadline: None,
+            blink_on: Duration::ZERO,
+            blink_off: Duration::ZERO,
+        }
+    }
+}
+
+impl CursorBlink {
+    fn reset(&mut self, style: &CursorStyle, now: Instant) {
+        self.visible = true;
+        self.phase = BlinkPhase::Waiting;
+        self.blink_on = Duration::from_millis(style.blink_on);
+        self.blink_off = Duration::from_millis(style.blink_off);
+        self.deadline = (style.blink_on > 0 && style.blink_off > 0)
+            .then(|| now + Duration::from_millis(style.blink_wait));
+    }
+
+    fn suspend(&mut self) {
+        self.visible = true;
+        self.deadline = None;
+    }
+
+    fn advance(&mut self, now: Instant) -> bool {
+        let Some(mut deadline) = self.deadline else {
+            return false;
+        };
+        if now < deadline {
+            return false;
+        }
+
+        let previous = self.visible;
+        while now >= deadline {
+            match self.phase {
+                BlinkPhase::Waiting | BlinkPhase::Visible => {
+                    self.visible = false;
+                    self.phase = BlinkPhase::Hidden;
+                    deadline += self.blink_off;
+                }
+                BlinkPhase::Hidden => {
+                    self.visible = true;
+                    self.phase = BlinkPhase::Visible;
+                    deadline += self.blink_on;
+                }
+            }
+        }
+        self.deadline = Some(deadline);
+        previous != self.visible
+    }
+}
 
 pub struct MadoApp {
     nvim: NvimProcess,
@@ -33,6 +105,8 @@ pub struct MadoApp {
     pressed_mouse_button: Option<&'static str>,
     close_requested: bool,
     ime_allowed: bool,
+    wheel: WheelAccumulator,
+    cursor_blink: CursorBlink,
     config: Config,
 }
 
@@ -49,6 +123,8 @@ impl MadoApp {
             pressed_mouse_button: None,
             close_requested: false,
             ime_allowed: false,
+            wheel: WheelAccumulator::default(),
+            cursor_blink: CursorBlink::default(),
             config,
         }
     }
@@ -64,7 +140,21 @@ impl MadoApp {
                                     self.set_ime_for_mode(mode);
                                 }
                             }
-                            let flush = events.iter().any(|event| self.grid.apply(event));
+                            let mut flush = false;
+                            for event in &events {
+                                flush |= self.grid.apply(event);
+                            }
+                            if events.iter().any(|event| {
+                                matches!(
+                                    event,
+                                    RedrawEvent::GridCursorGoto { .. }
+                                        | RedrawEvent::ModeChange { .. }
+                                        | RedrawEvent::ModeInfoSet { .. }
+                                )
+                            }) {
+                                self.cursor_blink
+                                    .reset(&self.grid.cursor_style(), Instant::now());
+                            }
                             if flush {
                                 self.update_ime_cursor_area();
                                 if let Some(window) = &self.window {
@@ -115,6 +205,14 @@ impl MadoApp {
             .notify("nvim_input", vec![Value::from(input)])
         {
             error!(%error, "failed to send input to Neovim");
+        }
+    }
+
+    fn wake_cursor(&mut self) {
+        self.cursor_blink
+            .reset(&self.grid.cursor_style(), Instant::now());
+        if let Some(window) = &self.window {
+            window.request_redraw();
         }
     }
 
@@ -281,7 +379,8 @@ impl ApplicationHandler for MadoApp {
             }
             WindowEvent::RedrawRequested => {
                 if let Some(renderer) = &mut self.renderer
-                    && let Err(error) = renderer.render(&self.grid, self.ime.preedit())
+                    && let Err(error) =
+                        renderer.render(&self.grid, self.ime.preedit(), self.cursor_blink.visible)
                 {
                     error!(%error, "render failed");
                 }
@@ -291,6 +390,7 @@ impl ApplicationHandler for MadoApp {
                 if !self.ime.blocks_keyboard_input()
                     && let Some(input) = key_to_nvim(&event, self.modifiers)
                 {
+                    self.wake_cursor();
                     self.send_input(input);
                 }
             }
@@ -310,7 +410,14 @@ impl ApplicationHandler for MadoApp {
                     window.request_redraw();
                 }
             }
-            WindowEvent::Focused(false) => self.ime.cancel(),
+            WindowEvent::Focused(false) => {
+                self.ime.cancel();
+                self.cursor_blink.suspend();
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+            WindowEvent::Focused(true) => self.wake_cursor(),
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse_position = position;
                 if let Some(button) = self.pressed_mouse_button {
@@ -325,6 +432,7 @@ impl ApplicationHandler for MadoApp {
                     _ => None,
                 };
                 if let Some(button) = button {
+                    self.wake_cursor();
                     let action = if state == ElementState::Pressed {
                         self.pressed_mouse_button = Some(button);
                         "press"
@@ -336,20 +444,28 @@ impl ApplicationHandler for MadoApp {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let (button, action) = match delta {
-                    MouseScrollDelta::LineDelta(_, y) if y > 0.0 => ("wheel", "up"),
-                    MouseScrollDelta::LineDelta(_, y) if y < 0.0 => ("wheel", "down"),
-                    MouseScrollDelta::LineDelta(x, _) if x > 0.0 => ("wheel", "right"),
-                    MouseScrollDelta::LineDelta(x, _) if x < 0.0 => ("wheel", "left"),
-                    MouseScrollDelta::PixelDelta(position) if position.y > 0.0 => ("wheel", "up"),
-                    MouseScrollDelta::PixelDelta(position) if position.y < 0.0 => ("wheel", "down"),
-                    MouseScrollDelta::PixelDelta(position) if position.x > 0.0 => {
-                        ("wheel", "right")
+                let (horizontal, vertical) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => (f64::from(x), f64::from(y)),
+                    MouseScrollDelta::PixelDelta(position) => {
+                        let Some(renderer) = &self.renderer else {
+                            return;
+                        };
+                        renderer.pixel_scroll_lines(position.x, position.y)
                     }
-                    MouseScrollDelta::PixelDelta(position) if position.x < 0.0 => ("wheel", "left"),
-                    _ => return,
                 };
-                self.send_mouse(button, action);
+                let directions = self.wheel.push(horizontal, vertical);
+                if !directions.is_empty() {
+                    self.wake_cursor();
+                }
+                for direction in directions {
+                    let action = match direction {
+                        WheelDirection::Up => "up",
+                        WheelDirection::Down => "down",
+                        WheelDirection::Left => "left",
+                        WheelDirection::Right => "right",
+                    };
+                    self.send_mouse("wheel", action);
+                }
             }
             _ => {}
         }
@@ -360,9 +476,12 @@ impl ApplicationHandler for MadoApp {
             self.open_file(&path);
         }
         self.process_rpc_events(event_loop);
-        event_loop.set_control_flow(ControlFlow::wait_duration(
-            std::time::Duration::from_millis(8),
-        ));
+        if self.cursor_blink.advance(Instant::now())
+            && let Some(window) = &self.window
+        {
+            window.request_redraw();
+        }
+        event_loop.set_control_flow(ControlFlow::wait_duration(Duration::from_millis(8)));
     }
 }
 
@@ -390,7 +509,9 @@ fn mode_allows_ime(mode: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::mode_allows_ime;
+    use super::{CursorBlink, mode_allows_ime};
+    use crate::nvim::redraw::CursorStyle;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn enables_ime_only_for_text_entry_modes() {
@@ -407,5 +528,26 @@ mod tests {
         for mode in ["normal", "visual", "operator", "select"] {
             assert!(!mode_allows_ime(mode), "{mode}");
         }
+    }
+
+    #[test]
+    fn follows_cursor_blink_timing() {
+        let start = Instant::now();
+        let mut blink = CursorBlink::default();
+        blink.reset(
+            &CursorStyle {
+                blink_wait: 100,
+                blink_on: 200,
+                blink_off: 50,
+                ..CursorStyle::default()
+            },
+            start,
+        );
+        assert!(blink.visible);
+        assert!(!blink.advance(start + Duration::from_millis(99)));
+        assert!(blink.advance(start + Duration::from_millis(100)));
+        assert!(!blink.visible);
+        assert!(blink.advance(start + Duration::from_millis(150)));
+        assert!(blink.visible);
     }
 }

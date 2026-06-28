@@ -1,6 +1,70 @@
 use winit::event::{ElementState, KeyEvent};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
+const MAX_WHEEL_STEPS_PER_EVENT: i32 = 32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WheelDirection {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+#[derive(Debug, Default)]
+pub struct WheelAccumulator {
+    horizontal: f64,
+    vertical: f64,
+}
+
+impl WheelAccumulator {
+    pub fn push(&mut self, horizontal: f64, vertical: f64) -> Vec<WheelDirection> {
+        if horizontal.is_finite() {
+            self.horizontal += horizontal;
+        }
+        if vertical.is_finite() {
+            self.vertical += vertical;
+        }
+
+        let vertical_steps = take_steps(&mut self.vertical);
+        let horizontal_steps = take_steps(&mut self.horizontal);
+        let mut directions = Vec::with_capacity(
+            vertical_steps.unsigned_abs() as usize + horizontal_steps.unsigned_abs() as usize,
+        );
+        directions.extend(repeated_direction(
+            vertical_steps,
+            WheelDirection::Up,
+            WheelDirection::Down,
+        ));
+        directions.extend(repeated_direction(
+            horizontal_steps,
+            WheelDirection::Right,
+            WheelDirection::Left,
+        ));
+        directions
+    }
+}
+
+fn take_steps(value: &mut f64) -> i32 {
+    let steps = value.trunc().clamp(
+        -(MAX_WHEEL_STEPS_PER_EVENT as f64),
+        MAX_WHEEL_STEPS_PER_EVENT as f64,
+    ) as i32;
+    *value -= f64::from(steps);
+    steps
+}
+
+fn repeated_direction(
+    steps: i32,
+    positive: WheelDirection,
+    negative: WheelDirection,
+) -> impl Iterator<Item = WheelDirection> {
+    std::iter::repeat_n(
+        if steps >= 0 { positive } else { negative },
+        steps.unsigned_abs() as usize,
+    )
+}
+
 pub fn key_to_nvim(event: &KeyEvent, modifiers: ModifiersState) -> Option<String> {
     if event.state != ElementState::Pressed {
         return None;
@@ -111,7 +175,7 @@ fn named_key(key: NamedKey, modifiers: ModifiersState) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::character_key;
+    use super::{WheelAccumulator, WheelDirection, character_key};
     use winit::keyboard::ModifiersState;
 
     #[test]
@@ -133,5 +197,28 @@ mod tests {
     #[test]
     fn does_not_forward_uncommitted_ime_key() {
         assert_eq!(character_key("k", None, ModifiersState::empty()), None);
+    }
+
+    #[test]
+    fn accumulates_high_resolution_wheel_motion() {
+        let mut wheel = WheelAccumulator::default();
+        assert!(wheel.push(0.0, 0.4).is_empty());
+        assert!(wheel.push(0.0, 0.4).is_empty());
+        assert_eq!(wheel.push(0.0, 0.4), [WheelDirection::Up]);
+    }
+
+    #[test]
+    fn preserves_wheel_magnitude_and_both_axes() {
+        let mut wheel = WheelAccumulator::default();
+        assert_eq!(
+            wheel.push(-2.0, -3.0),
+            [
+                WheelDirection::Down,
+                WheelDirection::Down,
+                WheelDirection::Down,
+                WheelDirection::Left,
+                WheelDirection::Left,
+            ]
+        );
     }
 }

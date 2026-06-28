@@ -5,15 +5,13 @@ preedit/commit separation are implemented.
 
 ## Rendering refinements
 
-- Cache shaped rows instead of rebuilding glyph buffers after every flush.
-- Render Neovim's mode-specific cursor shape and blink timing.
+- Benchmark the shaped-row cache with large grids and rapid scrolling.
 - Add visual regression checks for Japanese fallback fonts and HiDPI displays.
 
 ## Input and IME refinements
 
 - Exercise Japanese IME manually on both macOS and Windows.
 - Refine long preedit wrapping and selection-range display.
-- Add horizontal high-resolution wheel accumulation.
 
 ## Packaging refinements
 
