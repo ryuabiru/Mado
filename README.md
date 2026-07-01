@@ -4,6 +4,17 @@ Mado is a minimal Neovim GUI client. It starts Neovim in embedded mode, mirrors
 its line-grid UI in a native GPU-rendered window, and forwards keyboard, mouse,
 and committed IME input to Neovim.
 
+## Status
+
+Mado is open source and published under the MIT license.
+
+The first public release target is:
+
+- macOS 14+ on Apple Silicon (M1, M2, M3, M4)
+
+Windows support exists in the repository, but prebuilt public release artifacts
+are not the focus yet.
+
 ## Requirements
 
 - Rust 1.85 or newer
@@ -11,6 +22,12 @@ and committed IME input to Neovim.
 
 Mado searches for Neovim through `MADO_NVIM`, `PATH`, and common macOS and
 Windows install locations.
+
+## Release install
+
+For the first public GitHub release, download the macOS Apple Silicon build and
+open `Mado.app`. If Gatekeeper warns on first launch, use **Open** from Finder
+or remove quarantine after confirming the download source.
 
 ## Settings ownership
 
@@ -38,6 +55,24 @@ size = 15.0
 [window]
 width = 960
 height = 640
+theme = "auto"
+opacity = 1.0
+blur = false
+```
+
+`window.theme` controls the native window appearance (`auto`, `light`, or
+`dark`). `window.opacity` accepts values from `0.05` to `1.0`, so you can keep
+Neovim's main background slightly translucent without inventing a separate Mado
+colorscheme. `window.blur = true` asks the OS to blur transparent areas when
+the platform supports it.
+
+Example:
+
+```toml
+[window]
+theme = "dark"
+opacity = 0.9
+blur = true
 ```
 
 Use `mado --config PATH` to load another file. Missing or invalid settings fall
@@ -76,6 +111,9 @@ To keep it, copy `Mado.app` to `/Applications`. In Finder, control-click a
 source file, choose **Open With → Mado**, or use **Get Info → Open with →
 Change All** to make it the default for that file type. Finder file-open events
 are forwarded to the running Neovim instance without replacing unsaved work.
+
+The macOS app menu also includes **Settings...**, which opens Mado's
+`config.toml` and creates it automatically if it does not exist yet.
 
 ## Windows application and file associations
 

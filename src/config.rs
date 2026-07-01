@@ -1,5 +1,6 @@
 use std::env;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -24,6 +25,18 @@ pub struct FontConfig {
 pub struct WindowConfig {
     pub width: u32,
     pub height: u32,
+    pub theme: WindowTheme,
+    pub opacity: f32,
+    pub blur: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum WindowTheme {
+    #[default]
+    Auto,
+    Light,
+    Dark,
 }
 
 impl Default for FontConfig {
@@ -40,6 +53,9 @@ impl Default for WindowConfig {
         Self {
             width: 960,
             height: 640,
+            theme: WindowTheme::Auto,
+            opacity: 1.0,
+            blur: false,
         }
     }
 }
@@ -82,7 +98,35 @@ impl Config {
             && (6.0..=72.0).contains(&self.font.size)
             && (320..=16_384).contains(&self.window.width)
             && (200..=16_384).contains(&self.window.height)
+            && self.window.opacity.is_finite()
+            && (0.05..=1.0).contains(&self.window.opacity)
     }
+}
+
+pub fn default_config_template() -> &'static str {
+    r#"[font]
+family = "HackGen Console NF"
+size = 15.0
+
+[window]
+width = 960
+height = 640
+theme = "auto"
+opacity = 1.0
+blur = false
+"#
+}
+
+pub fn ensure_default_config_file() -> io::Result<PathBuf> {
+    let path = default_config_path()
+        .ok_or_else(|| io::Error::other("Mado config path is not available on this platform"))?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if !path.exists() {
+        fs::write(&path, default_config_template())?;
+    }
+    Ok(path)
 }
 
 pub fn default_config_path() -> Option<PathBuf> {
@@ -127,6 +171,9 @@ mod tests {
         assert_eq!(config.font.size, 18.0);
         assert_eq!(config.window.width, 1200);
         assert_eq!(config.window.height, 640);
+        assert_eq!(config.window.theme, WindowTheme::Auto);
+        assert_eq!(config.window.opacity, 1.0);
+        assert!(!config.window.blur);
     }
 
     #[test]
@@ -138,5 +185,14 @@ mod tests {
         config = Config::default();
         config.window.width = 1;
         assert!(!config.is_valid());
+        config = Config::default();
+        config.window.opacity = 0.0;
+        assert!(!config.is_valid());
+    }
+
+    #[test]
+    fn default_template_matches_defaults() {
+        let config: Config = toml::from_str(default_config_template()).unwrap();
+        assert_eq!(config, Config::default());
     }
 }

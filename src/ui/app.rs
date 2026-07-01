@@ -9,9 +9,9 @@ use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::keyboard::ModifiersState;
-use winit::window::{Icon, Window, WindowId};
+use winit::window::{Icon, Theme, Window, WindowId};
 
-use crate::config::Config;
+use crate::config::{Config, WindowTheme};
 use crate::nvim::process::{NvimEvent, NvimProcess};
 use crate::nvim::redraw::{CursorStyle, RedrawEvent, decode_redraw_notification};
 use crate::platform;
@@ -321,6 +321,9 @@ impl ApplicationHandler for MadoApp {
         let attributes = Window::default_attributes()
             .with_title("Mado")
             .with_window_icon(mado_window_icon())
+            .with_theme(window_theme(self.config.window.theme))
+            .with_transparent(self.config.window.opacity < 1.0 || self.config.window.blur)
+            .with_blur(self.config.window.blur)
             .with_inner_size(LogicalSize::new(
                 self.config.window.width as f64,
                 self.config.window.height as f64,
@@ -333,11 +336,13 @@ impl ApplicationHandler for MadoApp {
                 return;
             }
         };
+        platform::install_native_menu();
         window.set_ime_allowed(self.ime_allowed);
         let renderer = match pollster::block_on(Renderer::new(
             window.clone(),
             event_loop,
             &self.config.font,
+            self.config.window.opacity,
         )) {
             Ok(renderer) => renderer,
             Err(error) => {
@@ -482,6 +487,14 @@ impl ApplicationHandler for MadoApp {
             window.request_redraw();
         }
         event_loop.set_control_flow(ControlFlow::wait_duration(Duration::from_millis(8)));
+    }
+}
+
+fn window_theme(theme: WindowTheme) -> Option<Theme> {
+    match theme {
+        WindowTheme::Auto => None,
+        WindowTheme::Light => Some(Theme::Light),
+        WindowTheme::Dark => Some(Theme::Dark),
     }
 }
 

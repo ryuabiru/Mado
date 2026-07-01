@@ -71,6 +71,7 @@ pub struct Renderer {
     japanese_font: Option<String>,
     icon_font: Option<String>,
     scale_factor: f64,
+    background_alpha: f64,
     window: Arc<Window>,
 }
 
@@ -79,6 +80,7 @@ impl Renderer {
         window: Arc<Window>,
         event_loop: &ActiveEventLoop,
         font: &FontConfig,
+        background_opacity: f32,
     ) -> Result<Self> {
         let size = nonzero_size(window.inner_size());
         let instance = Instance::new(InstanceDescriptor::new_with_display_handle(Box::new(
@@ -109,7 +111,7 @@ impl Renderer {
             width: size.width,
             height: size.height,
             present_mode: PresentMode::Fifo,
-            alpha_mode: CompositeAlphaMode::Opaque,
+            alpha_mode: composite_alpha_mode(&capabilities, background_opacity),
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
@@ -167,6 +169,7 @@ impl Renderer {
             japanese_font,
             icon_font,
             scale_factor: window.scale_factor(),
+            background_alpha: f64::from(background_opacity),
             window,
         })
     }
@@ -336,7 +339,10 @@ impl Renderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: Operations {
-                        load: LoadOp::Clear(wgpu_color(grid.background())),
+                        load: LoadOp::Clear(wgpu_color_with_alpha(
+                            grid.background(),
+                            self.background_alpha,
+                        )),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -510,7 +516,7 @@ impl Renderer {
             let x = self.padding() + col as f32 * self.cell_width();
             let y = self.padding() + row as f32 * self.cell_height();
             if highlight.background != grid.background() {
-                self.push_rect(
+                self.push_background_rect(
                     vertices,
                     x,
                     y,
@@ -588,14 +594,21 @@ impl Renderer {
             let width = UnicodeWidthStr::width(text).max(1) as f32 * self.cell_width();
             let x = self.padding() + grid_cursor.col as f32 * self.cell_width();
             let y = self.padding() + grid_cursor.row as f32 * self.cell_height();
-            self.push_rect(vertices, x, y, width, self.cell_height(), 0x3b4252);
+            self.push_background_rect(
+                vertices,
+                x,
+                y,
+                width,
+                self.cell_height(),
+                0x3b4252,
+            );
             if let Some((start, end)) = preedit_cursor {
                 let start_col = byte_column(text, start);
                 let end_col = byte_column(text, end);
                 let selection_start = start_col.min(end_col) as f32 * self.cell_width();
                 let selection_width = start_col.abs_diff(end_col) as f32 * self.cell_width();
                 if selection_width > 0.0 {
-                    self.push_rect(
+                    self.push_background_rect(
                         vertices,
                         x + selection_start,
                         y,
@@ -649,11 +662,41 @@ impl Renderer {
         height: f32,
         color: u32,
     ) {
+        self.push_rect_vertices(vertices, x, y, width, height, linear_color(color, 1.0));
+    }
+
+    fn push_background_rect(
+        &self,
+        vertices: &mut Vec<RectVertex>,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        color: u32,
+    ) {
+        self.push_rect_vertices(
+            vertices,
+            x,
+            y,
+            width,
+            height,
+            linear_color(color, self.background_alpha as f32),
+        );
+    }
+
+    fn push_rect_vertices(
+        &self,
+        vertices: &mut Vec<RectVertex>,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        color: [f32; 4],
+    ) {
         let left = x / self.config.width as f32 * 2.0 - 1.0;
         let right = (x + width) / self.config.width as f32 * 2.0 - 1.0;
         let top = 1.0 - y / self.config.height as f32 * 2.0;
         let bottom = 1.0 - (y + height) / self.config.height as f32 * 2.0;
-        let color = linear_color(color);
         vertices.extend([
             RectVertex {
                 position: [left, top],
@@ -761,21 +804,21 @@ fn glyphon_color(rgb: u32) -> Color {
     )
 }
 
-fn wgpu_color(rgb: u32) -> wgpu::Color {
+fn wgpu_color_with_alpha(rgb: u32, alpha: f64) -> wgpu::Color {
     wgpu::Color {
         r: srgb_to_linear(((rgb >> 16) & 0xff) as f32 / 255.0) as f64,
         g: srgb_to_linear(((rgb >> 8) & 0xff) as f32 / 255.0) as f64,
         b: srgb_to_linear((rgb & 0xff) as f32 / 255.0) as f64,
-        a: 1.0,
+        a: alpha,
     }
 }
 
-fn linear_color(rgb: u32) -> [f32; 4] {
+fn linear_color(rgb: u32, alpha: f32) -> [f32; 4] {
     [
         srgb_to_linear(((rgb >> 16) & 0xff) as f32 / 255.0),
         srgb_to_linear(((rgb >> 8) & 0xff) as f32 / 255.0),
         srgb_to_linear((rgb & 0xff) as f32 / 255.0),
-        1.0,
+        alpha,
     ]
 }
 
@@ -804,6 +847,28 @@ fn cursor_cell_columns(grid: &GridState) -> usize {
 
 fn nonzero_size(size: PhysicalSize<u32>) -> PhysicalSize<u32> {
     PhysicalSize::new(size.width.max(1), size.height.max(1))
+}
+
+fn composite_alpha_mode(
+    capabilities: &wgpu::SurfaceCapabilities,
+    background_opacity: f32,
+) -> CompositeAlphaMode {
+    if background_opacity >= 1.0 {
+        return CompositeAlphaMode::Opaque;
+    }
+
+    for candidate in [
+        CompositeAlphaMode::PreMultiplied,
+        CompositeAlphaMode::PostMultiplied,
+        CompositeAlphaMode::Inherit,
+        CompositeAlphaMode::Auto,
+    ] {
+        if capabilities.alpha_modes.contains(&candidate) {
+            return candidate;
+        }
+    }
+
+    CompositeAlphaMode::Opaque
 }
 
 fn byte_column(text: &str, byte_index: usize) -> usize {
@@ -946,7 +1011,7 @@ mod tests {
     use super::{
         byte_column, contains_japanese, contains_private_use, cursor_cell_columns,
         find_font_family, find_icon_font, find_japanese_font, is_icon_font_family,
-        is_unified_font_family, srgb_to_linear,
+        is_unified_font_family, linear_color, srgb_to_linear,
     };
     use crate::nvim::redraw::{GridCell, RedrawEvent};
     use crate::ui::grid::GridState;
@@ -1039,6 +1104,7 @@ mod tests {
         assert!((srgb_to_linear(0.5) - 0.214_041_14).abs() < 0.0001);
         assert_eq!(srgb_to_linear(0.0), 0.0);
         assert_eq!(srgb_to_linear(1.0), 1.0);
+        assert_eq!(linear_color(0xff0000, 0.1)[3], 0.1);
     }
 
     #[test]

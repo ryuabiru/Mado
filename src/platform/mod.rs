@@ -11,6 +11,11 @@ pub fn install_file_open_handler() {
     macos::install();
 }
 
+pub fn install_native_menu() {
+    #[cfg(target_os = "macos")]
+    macos::install_native_menu();
+}
+
 pub fn take_open_files() -> Vec<PathBuf> {
     OPEN_FILES
         .get_or_init(|| Mutex::new(Vec::new()))
