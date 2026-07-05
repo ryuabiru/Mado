@@ -100,10 +100,10 @@ pub struct MadoApp {
     ime: ImeState,
     renderer: Option<Renderer>,
     window: Option<Arc<Window>>,
+    has_received_first_frame: bool,
     modifiers: ModifiersState,
     mouse_position: PhysicalPosition<f64>,
     pressed_mouse_button: Option<&'static str>,
-    close_requested: bool,
     ime_allowed: bool,
     wheel: WheelAccumulator,
     cursor_blink: CursorBlink,
@@ -118,10 +118,10 @@ impl MadoApp {
             ime: ImeState::default(),
             renderer: None,
             window: None,
+            has_received_first_frame: false,
             modifiers: ModifiersState::empty(),
             mouse_position: PhysicalPosition::new(0.0, 0.0),
             pressed_mouse_button: None,
-            close_requested: false,
             ime_allowed: false,
             wheel: WheelAccumulator::default(),
             cursor_blink: CursorBlink::default(),
@@ -156,6 +156,10 @@ impl MadoApp {
                                     .reset(&self.grid.cursor_style(), Instant::now());
                             }
                             if flush {
+                                if !self.has_received_first_frame {
+                                    self.has_received_first_frame = true;
+                                    self.update_window_title();
+                                }
                                 self.update_ime_cursor_area();
                                 if let Some(window) = &self.window {
                                     window.request_redraw();
@@ -274,12 +278,9 @@ impl MadoApp {
     }
 
     fn request_close(&mut self, event_loop: &ActiveEventLoop) {
-        if self.close_requested {
-            event_loop.exit();
-            return;
-        }
-        self.close_requested = true;
-        self.send_input("<Esc>:confirm qa<CR>".to_owned());
+        let _ = event_loop;
+        self.wake_cursor();
+        self.send_input(close_command());
     }
 
     fn open_file(&self, path: &std::path::Path) {
@@ -311,6 +312,12 @@ impl MadoApp {
             info!(path = %path.display(), "opening file from the OS");
         }
     }
+
+    fn update_window_title(&self) {
+        if let Some(window) = &self.window {
+            window.set_title(window_title(self.has_received_first_frame));
+        }
+    }
 }
 
 impl ApplicationHandler for MadoApp {
@@ -319,7 +326,7 @@ impl ApplicationHandler for MadoApp {
             return;
         }
         let attributes = Window::default_attributes()
-            .with_title("Mado")
+            .with_title(window_title(self.has_received_first_frame))
             .with_window_icon(mado_window_icon())
             .with_theme(window_theme(self.config.window.theme))
             .with_transparent(self.config.window.opacity < 1.0 || self.config.window.blur)
@@ -520,9 +527,21 @@ fn mode_allows_ime(mode: &str) -> bool {
         || mode.starts_with("terminal")
 }
 
+fn close_command() -> String {
+    "<Esc>:confirm qa<CR>".to_owned()
+}
+
+fn window_title(has_received_first_frame: bool) -> &'static str {
+    if has_received_first_frame {
+        "Mado"
+    } else {
+        "Mado — Starting…"
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{CursorBlink, mode_allows_ime};
+    use super::{CursorBlink, close_command, mode_allows_ime, window_title};
     use crate::nvim::redraw::CursorStyle;
     use std::time::{Duration, Instant};
 
@@ -562,5 +581,16 @@ mod tests {
         assert!(!blink.visible);
         assert!(blink.advance(start + Duration::from_millis(150)));
         assert!(blink.visible);
+    }
+
+    #[test]
+    fn close_uses_neovim_confirmation_flow() {
+        assert_eq!(close_command(), "<Esc>:confirm qa<CR>");
+    }
+
+    #[test]
+    fn window_title_reflects_startup_state() {
+        assert_eq!(window_title(false), "Mado — Starting…");
+        assert_eq!(window_title(true), "Mado");
     }
 }

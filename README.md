@@ -8,6 +8,12 @@ and committed IME input to Neovim. IME composition is supported so Japanese,
 Chinese, and Korean text input can flow through a native window instead of a
 terminal workaround.
 
+In other words, instead of launching `nvim` from a terminal, you can launch
+Neovim by opening an app window.
+
+From a user's point of view, that mostly means "Neovim as a desktop app" with
+better native window behavior and easier multilingual text input.
+
 ## Status
 
 Mado is open source and published under the MIT license.
@@ -21,30 +27,35 @@ are not the focus yet.
 
 ## Requirements
 
+If you only want to use a release build, you can usually just open the app.
+This section is mostly for developers.
+
 - Rust 1.85 or newer
 - Neovim with `ext_linegrid` support
 
-Mado searches for Neovim through `MADO_NVIM`, `PATH`, and common macOS and
-Windows install locations.
+Mado normally tries to find Neovim automatically. Technically, it checks
+`MADO_NVIM`, `PATH`, and common macOS and Windows install locations.
 
 ## Release install
 
 For the first public GitHub release, download the macOS Apple Silicon build and
-open `Mado.app`. If Gatekeeper warns on first launch, use **Open** from Finder
-or remove quarantine after confirming the download source.
+open `Mado.app`. On first launch, macOS may show a security warning. If that
+happens, confirm the download source and open the app from Finder.
 
 ## Settings ownership
 
 Neovim remains the source of truth for editor colors, highlights, and cursor
-shape. Mado owns native-window concerns such as the font and initial window
-size. For example, keep this in `init.lua`:
+shape. Mado owns app-window concerns such as the font and initial window size.
+
+If you already customize Neovim, you can keep settings like these in
+`init.lua`:
 
 ```lua
 vim.cmd.colorscheme("catppuccin-mocha")
 vim.o.guicursor = "n-v-c:block,i-ci-ve:ver25,r-cr-o:hor20"
 ```
 
-Mado reads `config.toml` from:
+Mado reads its settings file, `config.toml`, from:
 
 - macOS: `~/Library/Application Support/Mado/config.toml`
 - Windows: `%APPDATA%\Mado\config.toml`
@@ -73,7 +84,7 @@ Available settings:
 - `window.width`: initial window width from `320` to `16384`.
 - `window.height`: initial window height from `200` to `16384`.
 - `window.theme`: native window appearance. Choose `auto`, `light`, or `dark`.
-- `window.opacity`: background opacity from `0.05` to `1.0`.
+- `window.opacity`: background transparency from `0.05` to `1.0`.
 - `window.blur`: `true` or `false`. When enabled, Mado asks the OS to blur
   transparent areas on platforms that support it.
 
@@ -95,6 +106,9 @@ back to safe defaults. Mado does not maintain a separate editor colorscheme.
 
 ## Run
 
+For everyday use, opening the app is enough. This section shows a command-line
+example for development.
+
 ```sh
 cargo run -- README.md
 ```
@@ -105,17 +119,19 @@ include unknown UI events and protocol diagnostics.
 
 ## Test
 
+This section is mainly for developers.
+
 ```sh
 cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
-The test suite includes grid, input, IME, RPC, and a real
+The test suite includes rendering-state, input, IME, RPC, and a real
 `nvim --clean --embed` attach test when Neovim is installed.
 
 ## macOS application and file associations
 
-Build an ad-hoc signed application bundle from PowerShell:
+For development, you can build an application bundle from PowerShell:
 
 ```powershell
 ./scripts/build-macos-app.ps1
@@ -123,9 +139,9 @@ open ./target/release/Mado.app
 ```
 
 To keep it, copy `Mado.app` to `/Applications`. In Finder, control-click a
-source file, choose **Open With → Mado**, or use **Get Info → Open with →
-Change All** to make it the default for that file type. Finder file-open events
-are forwarded to the running Neovim instance without replacing unsaved work.
+source file and choose **Open With → Mado**, or use the file info window to set
+Mado as the default app for that file type. Finder file-open events are
+forwarded to the running Neovim instance without replacing unsaved work.
 
 The macOS app menu also includes **Settings...**, which opens Mado's
 `config.toml` and creates it automatically if it does not exist yet.
@@ -142,4 +158,5 @@ cargo build --release
 Mado will appear under **Open with** for common text and source-code files.
 Windows Settings remains responsible for selecting the default application.
 Undo the registration with `./packaging/windows/uninstall-associations.ps1`.
-A WiX v4 installer source is also available at `packaging/windows/Mado.wxs`.
+For developers, a WiX v4 installer source is also available at
+`packaging/windows/Mado.wxs`.

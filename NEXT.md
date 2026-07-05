@@ -7,11 +7,20 @@ preedit/commit separation are implemented.
 
 - Benchmark the shaped-row cache with large grids and rapid scrolling.
 - Add visual regression checks for Japanese fallback fonts and HiDPI displays.
+- Decide whether undercurl, underline, and preedit indicators need snapshot-style rendering checks.
+- Decide whether HiDPI pixel-snapping should extend from decorations to more text-adjacent overlays.
 
 ## Input and IME refinements
 
 - Exercise Japanese IME manually on both macOS and Windows.
-- Refine long preedit wrapping and selection-range display.
+- Refine candidate-window behavior and edge cases across different IMEs.
+- Decide whether long preedit should eventually wrap to a secondary inline row instead of staying single-line.
+
+## Ergonomics refinements
+
+- Decide whether the window title should reflect the current file or modified state from Neovim.
+- Decide whether Mado should expose a lightweight settings reload flow without requiring a full restart.
+- Decide whether startup state should also include a minimal visual placeholder inside the window, not just a title change.
 
 ## Packaging refinements
 

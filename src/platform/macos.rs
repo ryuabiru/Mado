@@ -5,7 +5,7 @@ use std::process::Command;
 use objc2::runtime::{AnyClass, AnyObject, Imp, ProtocolObject, Sel};
 use objc2::sel;
 use objc2_app_kit::{NSApplication, NSApplicationDelegate, NSMenuItem};
-use objc2_foundation::{NSArray, MainThreadMarker, NSString, NSURL};
+use objc2_foundation::{MainThreadMarker, NSArray, NSString, NSURL};
 
 use crate::config;
 

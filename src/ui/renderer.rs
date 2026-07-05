@@ -42,6 +42,13 @@ struct PreparedGlyph {
     color: Color,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextFontRole {
+    Primary,
+    JapaneseFallback,
+    IconFallback,
+}
+
 #[derive(Default)]
 struct CachedGlyphRow {
     revision: Option<u64>,
@@ -215,9 +222,13 @@ impl Renderer {
         preedit: Option<(&str, Option<(usize, usize)>)>,
     ) -> (PhysicalPosition<f64>, PhysicalSize<u32>) {
         let cursor = grid.cursor();
-        let preedit_columns = preedit
-            .and_then(|(text, cursor)| cursor.and_then(|(start, _)| text.get(..start)))
-            .map(UnicodeWidthStr::width)
+        let available_columns = ime_available_columns(grid);
+        let visible = preedit
+            .filter(|(text, _)| !text.is_empty())
+            .map(|(text, cursor)| visible_preedit(text, cursor, available_columns));
+        let preedit_columns = visible
+            .as_ref()
+            .map(|visible| visible.selection_end.saturating_sub(visible.start_column))
             .unwrap_or(0);
         let x = self.padding() + (cursor.col + preedit_columns) as f32 * self.cell_width();
         let y = self.padding() + (cursor.row + 1) as f32 * self.cell_height();
@@ -406,29 +417,18 @@ impl Renderer {
                     .font_family
                     .as_deref()
                     .is_some_and(is_unified_font_family);
-                let icon_family = self.icon_font.as_deref().map(Family::Name);
-                let japanese_family = self.japanese_font.as_deref().map(Family::Name);
-                let uses_icon_font =
-                    !uses_unified_font && contains_private_use(&cell.text) && icon_family.is_some();
-                let uses_japanese_font = !uses_unified_font
-                    && !uses_icon_font
-                    && contains_japanese(&cell.text)
-                    && japanese_family.is_some();
-                let family = if uses_unified_font {
-                    self.font_family
-                        .as_deref()
-                        .map(Family::Name)
-                        .unwrap_or(Family::Monospace)
-                } else if uses_icon_font {
-                    icon_family.unwrap_or(Family::Monospace)
-                } else if uses_japanese_font {
-                    japanese_family.unwrap_or(Family::Monospace)
-                } else {
-                    self.font_family
-                        .as_deref()
-                        .map(Family::Name)
-                        .unwrap_or(Family::Monospace)
-                };
+                let role = font_role_for_text(
+                    &cell.text,
+                    uses_unified_font,
+                    self.icon_font.is_some(),
+                    self.japanese_font.is_some(),
+                );
+                let family = font_family_for_role(
+                    role,
+                    self.font_family.as_deref(),
+                    self.japanese_font.as_deref(),
+                    self.icon_font.as_deref(),
+                );
                 let attrs = text_attrs(highlight, family);
                 let mut buffer = Buffer::new(&mut self.font_system, metrics);
                 buffer.set_wrap(&mut self.font_system, Wrap::None);
@@ -441,7 +441,7 @@ impl Renderer {
                     &mut self.font_system,
                     &cell.text,
                     &attrs,
-                    if uses_unified_font || uses_icon_font || uses_japanese_font {
+                    if role != TextFontRole::Primary || uses_unified_font {
                         Shaping::Basic
                     } else {
                         Shaping::Advanced
@@ -468,12 +468,16 @@ impl Renderer {
         }
 
         self.preedit_glyph = None;
-        if let Some((text, _)) = preedit.filter(|(text, _)| !text.is_empty()) {
+        if let Some((text, cursor)) = preedit.filter(|(text, _)| !text.is_empty()) {
+            let visible = visible_preedit(text, cursor, ime_available_columns(grid));
+            if visible.text.is_empty() {
+                return;
+            }
             let mut buffer = Buffer::new(&mut self.font_system, metrics);
             buffer.set_wrap(&mut self.font_system, Wrap::None);
             buffer.set_size(
                 &mut self.font_system,
-                Some((UnicodeWidthStr::width(text).max(1) as f32 + 1.0) * cell_width),
+                Some((visible.width.max(1) as f32 + 1.0) * cell_width),
                 Some(cell_height),
             );
             let unified_font = self
@@ -490,7 +494,7 @@ impl Renderer {
             } else {
                 Shaping::Advanced
             };
-            buffer.set_text(&mut self.font_system, text, &attrs, shaping, None);
+            buffer.set_text(&mut self.font_system, visible.text, &attrs, shaping, None);
             buffer.shape_until_scroll(&mut self.font_system, false);
             let cursor = grid.cursor();
             self.preedit_glyph = Some(PreparedGlyph {
@@ -525,13 +529,30 @@ impl Renderer {
                     highlight.background,
                 );
             }
-            if highlight.underline || highlight.undercurl {
+            let line_thickness = snap_line_thickness(self.scale());
+            if highlight.undercurl {
+                for (segment_x, segment_y, segment_width, segment_height) in
+                    undercurl_segments(x, y, self.cell_width(), self.cell_height(), self.scale())
+                {
+                    self.push_rect(
+                        vertices,
+                        segment_x,
+                        segment_y,
+                        segment_width,
+                        segment_height,
+                        highlight.special,
+                    );
+                }
+            } else if highlight.underline {
                 self.push_rect(
                     vertices,
                     x,
-                    y + self.cell_height() - self.scale_factor as f32 * 2.0,
+                    snap_to_device_pixel(
+                        y + self.cell_height() - line_thickness * 2.0,
+                        self.scale(),
+                    ),
                     self.cell_width(),
-                    self.scale_factor as f32,
+                    line_thickness,
                     highlight.special,
                 );
             }
@@ -539,9 +560,9 @@ impl Renderer {
                 self.push_rect(
                     vertices,
                     x,
-                    y + self.cell_height() * 0.55,
+                    snap_to_device_pixel(y + self.cell_height() * 0.55, self.scale()),
                     self.cell_width(),
-                    self.scale_factor as f32,
+                    line_thickness,
                     highlight.special,
                 );
             }
@@ -549,9 +570,9 @@ impl Renderer {
                 self.push_rect(
                     vertices,
                     x,
-                    y,
+                    snap_to_device_pixel(y, self.scale()),
                     self.cell_width(),
-                    self.scale_factor as f32,
+                    line_thickness,
                     highlight.special,
                 );
             }
@@ -590,21 +611,38 @@ impl Renderer {
         }
 
         if let Some((text, preedit_cursor)) = preedit.filter(|(text, _)| !text.is_empty()) {
+            let visible = visible_preedit(text, preedit_cursor, ime_available_columns(grid));
+            if visible.text.is_empty() {
+                return;
+            }
             let grid_cursor = grid.cursor();
-            let width = UnicodeWidthStr::width(text).max(1) as f32 * self.cell_width();
+            let width = visible.width.max(1) as f32 * self.cell_width();
             let x = self.padding() + grid_cursor.col as f32 * self.cell_width();
             let y = self.padding() + grid_cursor.row as f32 * self.cell_height();
-            self.push_background_rect(
-                vertices,
-                x,
-                y,
-                width,
-                self.cell_height(),
-                0x3b4252,
-            );
-            if let Some((start, end)) = preedit_cursor {
-                let start_col = byte_column(text, start);
-                let end_col = byte_column(text, end);
+            self.push_background_rect(vertices, x, y, width, self.cell_height(), 0x3b4252);
+            if visible.clipped_start {
+                self.push_rect(
+                    vertices,
+                    x,
+                    y + self.scale_factor as f32 * 2.0,
+                    self.scale_factor as f32 * 2.0,
+                    self.cell_height() - self.scale_factor as f32 * 4.0,
+                    0x88c0d0,
+                );
+            }
+            if visible.clipped_end {
+                self.push_rect(
+                    vertices,
+                    x + width - self.scale_factor as f32 * 2.0,
+                    y + self.scale_factor as f32 * 2.0,
+                    self.scale_factor as f32 * 2.0,
+                    self.cell_height() - self.scale_factor as f32 * 4.0,
+                    0x88c0d0,
+                );
+            }
+            if visible.selection_end >= visible.start_column {
+                let start_col = visible.selection_start.saturating_sub(visible.start_column);
+                let end_col = visible.selection_end.saturating_sub(visible.start_column);
                 let selection_start = start_col.min(end_col) as f32 * self.cell_width();
                 let selection_width = start_col.abs_diff(end_col) as f32 * self.cell_width();
                 if selection_width > 0.0 {
@@ -871,6 +909,160 @@ fn composite_alpha_mode(
     CompositeAlphaMode::Opaque
 }
 
+#[derive(Debug, Clone, Copy)]
+struct VisiblePreedit<'a> {
+    text: &'a str,
+    width: usize,
+    start_column: usize,
+    selection_start: usize,
+    selection_end: usize,
+    clipped_start: bool,
+    clipped_end: bool,
+}
+
+fn ime_available_columns(grid: &GridState) -> usize {
+    grid.width().saturating_sub(grid.cursor().col).max(1)
+}
+
+fn visible_preedit<'a>(
+    text: &'a str,
+    cursor: Option<(usize, usize)>,
+    available_columns: usize,
+) -> VisiblePreedit<'a> {
+    let total_width = UnicodeWidthStr::width(text);
+    let (selection_start, selection_end) = cursor
+        .map(|(start, end)| (byte_column(text, start), byte_column(text, end)))
+        .unwrap_or((total_width, total_width));
+    let start_column = preedit_window_start(
+        selection_start,
+        selection_end,
+        total_width,
+        available_columns,
+    );
+    let end_column = start_column
+        .saturating_add(available_columns)
+        .min(total_width);
+    let start_byte = byte_index_for_column(text, start_column);
+    let end_byte = byte_index_for_column(text, end_column);
+    VisiblePreedit {
+        text: &text[start_byte..end_byte],
+        width: end_column.saturating_sub(start_column),
+        start_column,
+        selection_start,
+        selection_end,
+        clipped_start: start_column > 0,
+        clipped_end: end_column < total_width,
+    }
+}
+
+fn preedit_window_start(
+    selection_start: usize,
+    selection_end: usize,
+    total_width: usize,
+    available_columns: usize,
+) -> usize {
+    if total_width <= available_columns {
+        return 0;
+    }
+
+    let selection_min = selection_start.min(selection_end);
+    let selection_max = selection_start.max(selection_end);
+    let selection_width = selection_max.saturating_sub(selection_min);
+
+    if selection_width >= available_columns {
+        return selection_min.min(total_width.saturating_sub(available_columns));
+    }
+
+    let mut start = selection_max.saturating_sub(available_columns);
+    if selection_min < start {
+        start = selection_min;
+    }
+    start.min(total_width.saturating_sub(available_columns))
+}
+
+fn font_role_for_text(
+    text: &str,
+    uses_unified_font: bool,
+    has_icon_font: bool,
+    has_japanese_font: bool,
+) -> TextFontRole {
+    if uses_unified_font {
+        return TextFontRole::Primary;
+    }
+    if has_icon_font && contains_private_use(text) {
+        return TextFontRole::IconFallback;
+    }
+    if has_japanese_font && contains_japanese(text) {
+        return TextFontRole::JapaneseFallback;
+    }
+    TextFontRole::Primary
+}
+
+fn font_family_for_role<'a>(
+    role: TextFontRole,
+    primary: Option<&'a str>,
+    japanese: Option<&'a str>,
+    icon: Option<&'a str>,
+) -> Family<'a> {
+    match role {
+        TextFontRole::Primary => primary.map(Family::Name).unwrap_or(Family::Monospace),
+        TextFontRole::JapaneseFallback => japanese
+            .or(primary)
+            .map(Family::Name)
+            .unwrap_or(Family::Monospace),
+        TextFontRole::IconFallback => icon
+            .or(primary)
+            .map(Family::Name)
+            .unwrap_or(Family::Monospace),
+    }
+}
+
+fn snap_to_device_pixel(value: f32, scale: f32) -> f32 {
+    let scale = scale.max(1.0);
+    (value * scale).round() / scale
+}
+
+fn snap_line_thickness(scale: f32) -> f32 {
+    (1.0 / scale.max(1.0)).max(1.0 / scale.max(1.0))
+}
+
+fn undercurl_segments(
+    x: f32,
+    y: f32,
+    cell_width: f32,
+    cell_height: f32,
+    scale: f32,
+) -> Vec<(f32, f32, f32, f32)> {
+    let thickness = snap_line_thickness(scale);
+    let segment_width = (cell_width / 4.0).max(thickness);
+    let baseline = snap_to_device_pixel(y + cell_height - scale.max(1.0) * 2.0 - thickness, scale);
+    let amplitude = (cell_height * 0.12).max(thickness);
+    let mut segments = Vec::new();
+    let mut current_x = x;
+    let end_x = x + cell_width;
+    let mut phase = 0usize;
+    while current_x < end_x {
+        let width = (end_x - current_x).min(segment_width);
+        let offset = match phase % 4 {
+            0 => amplitude,
+            1 => 0.0,
+            2 => -amplitude,
+            _ => 0.0,
+        };
+        let segment_y =
+            snap_to_device_pixel(baseline + offset, scale).clamp(y, y + cell_height - thickness);
+        segments.push((
+            snap_to_device_pixel(current_x, scale),
+            segment_y,
+            width,
+            thickness,
+        ));
+        current_x += width;
+        phase += 1;
+    }
+    segments
+}
+
 fn byte_column(text: &str, byte_index: usize) -> usize {
     text.get(..byte_index.min(text.len()))
         .map(UnicodeWidthStr::width)
@@ -880,6 +1072,25 @@ fn byte_column(text: &str, byte_index: usize) -> usize {
                 .map(|(_, character)| character.width().unwrap_or(0))
                 .sum()
         })
+}
+
+fn byte_index_for_column(text: &str, target_column: usize) -> usize {
+    if target_column == 0 {
+        return 0;
+    }
+
+    let mut consumed_columns = 0;
+    for (index, character) in text.char_indices() {
+        let width = character.width().unwrap_or(0);
+        if consumed_columns >= target_column {
+            return index;
+        }
+        consumed_columns += width;
+        if consumed_columns >= target_column {
+            return index + character.len_utf8();
+        }
+    }
+    text.len()
 }
 
 fn glyph_positions_are_safe(glyph: &PreparedGlyph) -> bool {
@@ -1009,9 +1220,11 @@ fn contains_private_use(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        byte_column, contains_japanese, contains_private_use, cursor_cell_columns,
-        find_font_family, find_icon_font, find_japanese_font, is_icon_font_family,
-        is_unified_font_family, linear_color, srgb_to_linear,
+        TextFontRole, byte_column, byte_index_for_column, contains_japanese, contains_private_use,
+        cursor_cell_columns, find_font_family, find_icon_font, find_japanese_font,
+        font_role_for_text, is_icon_font_family, is_unified_font_family, linear_color,
+        preedit_window_start, snap_line_thickness, snap_to_device_pixel, srgb_to_linear,
+        undercurl_segments, visible_preedit,
     };
     use crate::nvim::redraw::{GridCell, RedrawEvent};
     use crate::ui::grid::GridState;
@@ -1022,6 +1235,82 @@ mod tests {
         assert_eq!(byte_column("a日本", 1), 1);
         assert_eq!(byte_column("a日本", 4), 3);
         assert_eq!(byte_column("a日本", 7), 5);
+    }
+
+    #[test]
+    fn converts_grid_columns_back_to_byte_offsets() {
+        assert_eq!(byte_index_for_column("a日本", 0), 0);
+        assert_eq!(byte_index_for_column("a日本", 1), 1);
+        assert_eq!(byte_index_for_column("a日本", 3), 4);
+        assert_eq!(byte_index_for_column("a日本", 5), 7);
+    }
+
+    #[test]
+    fn keeps_the_preedit_selection_visible_when_text_is_long() {
+        let visible = visible_preedit("かな漢字まじりの長い変換テキスト", Some((24, 24)), 6);
+        assert!(visible.width <= 6);
+        assert!(visible.selection_end >= visible.start_column);
+        assert!(visible.selection_end <= visible.start_column + 6);
+        assert!(visible.clipped_start || visible.clipped_end);
+    }
+
+    #[test]
+    fn prefers_the_selection_start_when_selection_is_wider_than_view() {
+        let start = preedit_window_start(3, 12, 20, 5);
+        assert_eq!(start, 3);
+    }
+
+    #[test]
+    fn reports_when_preedit_is_clipped_on_each_side() {
+        let left = visible_preedit("abcdef", Some((0, 0)), 3);
+        assert!(!left.clipped_start);
+        assert!(left.clipped_end);
+
+        let right = visible_preedit("abcdef", Some((6, 6)), 3);
+        assert!(right.clipped_start);
+        assert!(!right.clipped_end);
+    }
+
+    #[test]
+    fn builds_undercurl_segments_within_the_cell_width() {
+        let segments = undercurl_segments(10.0, 20.0, 12.0, 18.0, 2.0);
+        assert!(!segments.is_empty());
+        let covered_width: f32 = segments.iter().map(|(_, _, width, _)| width).sum();
+        assert!((covered_width - 12.0).abs() < 0.001);
+        assert!(segments.iter().all(|(x, y, width, height)| {
+            *x >= 10.0
+                && *x + *width <= 22.001
+                && *y >= 20.0
+                && *y + *height <= 38.0
+                && *height >= 0.5
+        }));
+    }
+
+    #[test]
+    fn snaps_decoration_positions_to_device_pixels_for_hidpi() {
+        assert_eq!(snap_to_device_pixel(10.24, 2.0), 10.0);
+        assert_eq!(snap_to_device_pixel(10.26, 2.0), 10.5);
+        assert_eq!(snap_line_thickness(2.0), 0.5);
+    }
+
+    #[test]
+    fn prefers_japanese_fallback_only_for_japanese_text() {
+        assert_eq!(
+            font_role_for_text("日本語", false, true, true),
+            TextFontRole::JapaneseFallback
+        );
+        assert_eq!(
+            font_role_for_text("\u{f07c}", false, true, true),
+            TextFontRole::IconFallback
+        );
+        assert_eq!(
+            font_role_for_text("plain ASCII", false, true, true),
+            TextFontRole::Primary
+        );
+        assert_eq!(
+            font_role_for_text("日本語", true, true, true),
+            TextFontRole::Primary
+        );
     }
 
     #[test]
