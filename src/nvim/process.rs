@@ -1,7 +1,10 @@
+use std::collections::HashMap;
 use std::env;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail};
 use rmpv::Value;
@@ -26,6 +29,7 @@ pub struct NvimProcess {
 impl NvimProcess {
     pub fn spawn(options: NvimLaunchOptions) -> Result<Self> {
         let mut command = Command::new(&options.executable);
+        apply_launch_environment(&mut command);
         if options.clean {
             command.arg("--clean");
         }
@@ -99,7 +103,13 @@ pub fn discover_nvim() -> Result<PathBuf> {
         }
     }
 
-    if let Some(path) = find_on_path(nvim_binary_name()) {
+    if let Some(path) = find_on_path(nvim_binary_name(), env::var_os("PATH").as_deref()) {
+        return Ok(path);
+    }
+
+    if let Some(path) = shell_path()
+        .and_then(|path| find_on_path(nvim_binary_name(), Some(path.as_os_str())))
+    {
         return Ok(path);
     }
 
@@ -118,11 +128,82 @@ pub fn discover_nvim() -> Result<PathBuf> {
     bail!("Neovim was not found. Set MADO_NVIM or add nvim to PATH. Checked: {searched}")
 }
 
-fn find_on_path(binary: &str) -> Option<PathBuf> {
-    let path = env::var_os("PATH")?;
+fn find_on_path(binary: &str, path: Option<&OsStr>) -> Option<PathBuf> {
+    let path = path?;
     env::split_paths(&path)
         .map(|directory| directory.join(binary))
         .find(|candidate| is_executable_file(candidate))
+}
+
+fn apply_launch_environment(command: &mut Command) {
+    #[cfg(target_os = "macos")]
+    if let Some(environment) = shell_environment() {
+        for (key, value) in environment {
+            command.env(key, value);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn shell_path() -> Option<&'static OsString> {
+    shell_environment()?.get(OsStr::new("PATH"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn shell_path() -> Option<&'static OsString> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn shell_environment() -> Option<&'static HashMap<OsString, OsString>> {
+    static SHELL_ENVIRONMENT: OnceLock<Option<HashMap<OsString, OsString>>> = OnceLock::new();
+    SHELL_ENVIRONMENT.get_or_init(load_shell_environment).as_ref()
+}
+
+#[cfg(target_os = "macos")]
+fn load_shell_environment() -> Option<HashMap<OsString, OsString>> {
+    let shell = env::var_os("SHELL").unwrap_or_else(|| OsString::from("/bin/zsh"));
+    let output = Command::new(shell)
+        .arg("-lc")
+        .arg("env -0")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let environment = parse_shell_environment(&output.stdout);
+    if environment.is_empty() {
+        None
+    } else {
+        Some(environment)
+    }
+}
+
+fn parse_shell_environment(output: &[u8]) -> HashMap<OsString, OsString> {
+    let mut environment = HashMap::new();
+
+    for entry in output.split(|byte| *byte == 0).filter(|entry| !entry.is_empty()) {
+        let Some(split_index) = entry.iter().position(|byte| *byte == b'=') else {
+            continue;
+        };
+        let key = OsString::from(String::from_utf8_lossy(&entry[..split_index]).into_owned());
+        if should_ignore_environment_key(&key) {
+            continue;
+        }
+        let value =
+            OsString::from(String::from_utf8_lossy(&entry[split_index + 1..]).into_owned());
+        environment.insert(key, value);
+    }
+
+    environment
+}
+
+fn should_ignore_environment_key(key: &OsStr) -> bool {
+    matches!(
+        key.to_str(),
+        Some("PWD" | "OLDPWD" | "SHLVL" | "_" | "TERM" | "TERM_PROGRAM")
+    )
 }
 
 fn is_executable_file(path: &Path) -> bool {
@@ -179,4 +260,42 @@ fn platform_candidates() -> Vec<PathBuf> {
     }
 
     candidates
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsStr;
+
+    use super::{parse_shell_environment, should_ignore_environment_key};
+
+    #[test]
+    fn parses_nul_delimited_environment_output() {
+        let environment = parse_shell_environment(
+            b"PATH=/opt/homebrew/bin:/usr/bin\0HOME=/Users/tester\0EMPTY=\0",
+        );
+
+        assert_eq!(
+            environment.get(OsStr::new("PATH")).map(OsStr::new),
+            Some(OsStr::new("/opt/homebrew/bin:/usr/bin"))
+        );
+        assert_eq!(
+            environment.get(OsStr::new("HOME")).map(OsStr::new),
+            Some(OsStr::new("/Users/tester"))
+        );
+        assert_eq!(
+            environment.get(OsStr::new("EMPTY")).map(OsStr::new),
+            Some(OsStr::new(""))
+        );
+    }
+
+    #[test]
+    fn ignores_shell_local_entries() {
+        let environment = parse_shell_environment(b"PWD=/tmp/demo\0SHLVL=2\0_=/bin/env\0");
+
+        assert!(environment.is_empty());
+        assert!(should_ignore_environment_key(OsStr::new("PWD")));
+        assert!(should_ignore_environment_key(OsStr::new("SHLVL")));
+        assert!(should_ignore_environment_key(OsStr::new("_")));
+        assert!(!should_ignore_environment_key(OsStr::new("PATH")));
+    }
 }

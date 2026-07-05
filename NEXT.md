@@ -18,6 +18,9 @@ preedit/commit separation are implemented.
 
 ## Ergonomics refinements
 
+- Expand compatibility testing against real-world Neovim plugin setups, especially LSP, lint, formatter, and completion stacks.
+- Decide which embedded-UI capabilities are required to match day-to-day GUI expectations from mature clients such as Neovide.
+- Audit Finder-launched macOS behavior beyond `PATH`, including project root detection and any plugin features that still assume a terminal-hosted session.
 - Decide whether the window title should reflect the current file or modified state from Neovim.
 - Decide whether Mado should expose a lightweight settings reload flow without requiring a full restart.
 - Decide whether startup state should also include a minimal visual placeholder inside the window, not just a title change.
