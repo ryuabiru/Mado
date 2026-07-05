@@ -1,8 +1,12 @@
 # Mado
 
+[日本語版 README](README_ja.md)
+
 Mado is a minimal Neovim GUI client. It starts Neovim in embedded mode, mirrors
 its line-grid UI in a native GPU-rendered window, and forwards keyboard, mouse,
-and committed IME input to Neovim.
+and committed IME input to Neovim. IME composition is supported so Japanese,
+Chinese, and Korean text input can flow through a native window instead of a
+terminal workaround.
 
 ## Status
 
@@ -60,11 +64,22 @@ opacity = 1.0
 blur = false
 ```
 
-`window.theme` controls the native window appearance (`auto`, `light`, or
-`dark`). `window.opacity` accepts values from `0.05` to `1.0`, so you can keep
-Neovim's main background slightly translucent without inventing a separate Mado
-colorscheme. `window.blur = true` asks the OS to blur transparent areas when
-the platform supports it.
+Available settings:
+
+- `font.family`: font family name used for the editor window. The default
+  `HackGen Console NF` is chosen to work well for code, Nerd Font glyphs, and
+  Japanese text.
+- `font.size`: font size from `6.0` to `72.0`.
+- `window.width`: initial window width from `320` to `16384`.
+- `window.height`: initial window height from `200` to `16384`.
+- `window.theme`: native window appearance. Choose `auto`, `light`, or `dark`.
+- `window.opacity`: background opacity from `0.05` to `1.0`.
+- `window.blur`: `true` or `false`. When enabled, Mado asks the OS to blur
+  transparent areas on platforms that support it.
+
+If any setting file entry is missing, Mado fills it with the default value. If
+the file includes unknown keys or invalid values, Mado falls back to safe
+defaults.
 
 Example:
 
